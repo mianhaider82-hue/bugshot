@@ -52,7 +52,7 @@ export interface EvidenceSnapshot {
 }
 
 export const backgroundService = {
-  startSession(sessionId: string): Promise<{ ok: boolean; tabId: number | null }> {
+  startSession(sessionId: string): Promise<{ ok: boolean; tabId: number | null; networkCapturing: boolean }> {
     return sendMessage({ kind: 'START_SESSION', sessionId });
   },
   endSession(sessionId: string): Promise<{ ok: boolean }> {
@@ -119,7 +119,7 @@ export async function capturePageContext(tabId: number): Promise<{
       pageInfo: {
         url: tab.url ?? '',
         title: tab.title ?? '',
-        referrer: tab.referrer ?? '',
+        referrer: '',
         timestamp: new Date().toISOString(),
         tabId: tab.id ?? tabId,
         windowId: tab.windowId,
@@ -135,7 +135,7 @@ export async function capturePageContext(tabId: number): Promise<{
     windowId: tab.windowId,
     url: tab.url ?? res.pageInfo?.url ?? '',
     title: tab.title ?? res.pageInfo?.title ?? '',
-    referrer: tab.referrer ?? res.pageInfo?.referrer ?? '',
+    referrer: res.pageInfo?.referrer ?? '',
   };
   return { pageInfo, environment: res.environment ?? fallbackEnv };
 }

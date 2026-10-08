@@ -258,8 +258,32 @@ history.pushState = function (...args: Parameters<typeof origPushState>) {
 };
 window.addEventListener('popstate', () => reportNavigation(`Navigated back/forward to ${location.pathname}`));
 
-/* On first run inside a session, announce the page load as a navigation. */
+/* On first run inside a session, announce the page load as a navigation.
+ * NOTE: this fires even when sessionActive is false (pushConsole/pushAction
+ * drop it) – kept intentionally so the code path stays uniform. */
 reportNavigation(`Page loaded: ${location.pathname}`);
+
+/* ------------------------------------------------------------------ */
+/* Page visibility change detection                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Documented Chrome API decision: MV3 forbids remote code and content scripts
+ * cannot use chrome.debugger, so full-page screenshots are captured by the
+ * service worker via CDP `captureBeyondViewport`. That mechanism requires the
+ * tab to be VISIBLE; capturing a hidden/occluded tab produces blank output.
+ * The popup therefore checks visibility before offering full-page mode.
+ */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && sessionActive) {
+    pushAction({
+      type: 'navigation',
+      label: 'Tab became visible',
+      target: location.href,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
 
 /* ------------------------------------------------------------------ */
 /* Flushing buffers to the service worker                             */

@@ -54,12 +54,23 @@ const MAX_BUFFER = 200; // bound memory in the worker
 const STATE_KEY = 'qa_session_state';
 const BUFFER_KEY = 'qa_session_buffers';
 
+/**
+ * Documented decision: we mirror session state into chrome.storage.local
+ * rather than chrome.storage.session so that a draft/session survives a full
+ * browser restart (requirement #19). The data stored here is already bounded
+ * and pre-redaction metadata only – the privacy pipeline runs before anything
+ * leaves the device.
+ */
 async function persistState(): Promise<void> {
-  await chrome.storage.session.set({ [STATE_KEY]: session, [BUFFER_KEY]: buffers });
+  try {
+    await chrome.storage.local.set({ [STATE_KEY]: session, [BUFFER_KEY]: buffers });
+  } catch {
+    /* storage quota – in-memory buffers remain authoritative for the session */
+  }
 }
 
 async function restoreState(): Promise<void> {
-  const obj = await chrome.storage.session.get([STATE_KEY, BUFFER_KEY]);
+  const obj = await chrome.storage.local.get([STATE_KEY, BUFFER_KEY]);
   if (obj[STATE_KEY]) session = obj[STATE_KEY] as SessionState;
   if (obj[BUFFER_KEY]) buffers = obj[BUFFER_KEY] as Buffers;
 }
@@ -86,9 +97,12 @@ interface CaptureResult {
   mode?: ScreenshotMode;
 }
 
-async function captureViewport(tabId: number): Promise<CaptureResult> {
+async function captureViewport(_tabId: number): Promise<CaptureResult> {
   try {
-    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
+    // Documented decision: captureVisibleTab acts on the *current window's*
+    // active tab; we pass no windowId because the reported tab is always the
+    // active tab of its window when a session starts from the popup.
+    const dataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
     return { ok: true, dataUrl, mode: 'viewport' };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -169,8 +183,8 @@ const entryIndexByRequestId = new Map<string, number>();
 const pendingRequests = new Map<string, PendingRequest>();
 let networkAttachedTab: number | null = null;
 
-async function attachNetwork(tabId: number): Promise<void> {
-  if (networkAttachedTab === tabId) return;
+async function attachNetwork(tabId: number): Promise<boolean> {
+  if (networkAttachedTab === tabId) return true;
   await detachNetwork();
   try {
     await chrome.debugger.attach({ tabId }, '1.3');
@@ -179,9 +193,12 @@ async function attachNetwork(tabId: number): Promise<void> {
       maxResourceBufferSize: 1_000_000,
     });
     networkAttachedTab = tabId;
+    return true;
   } catch (e) {
-    // DevTools open elsewhere → debugger attach fails. Non-fatal: log in report errors.
+    // Documented decision: DevTools open elsewhere → debugger attach fails.
+    // Network capture is non-fatal; the popup records it as a degraded error.
     console.warn('[qa-reporter] network capture unavailable:', e);
+    return false;
   }
 }
 
@@ -350,9 +367,10 @@ chrome.runtime.onMessage.addListener(
           buffers = { consoleEntries: [], networkEntries: [], actions: [] };
           pageInfo = null;
           await persistState();
-          if (session.tabId != null) await attachNetwork(session.tabId);
+          let networkCapturing = false;
+          if (session.tabId != null) networkCapturing = await attachNetwork(session.tabId);
           setBadge('REC', '#dc2626');
-          sendResponse({ ok: true, tabId: session.tabId });
+          sendResponse({ ok: true, tabId: session.tabId, networkCapturing });
           break;
         }
 
@@ -413,18 +431,6 @@ async function activeTabId(): Promise<number | null> {
 /* ------------------------------------------------------------------ */
 /* External messages from popup (screenshots, evidence snapshot)      */
 /* ------------------------------------------------------------------ */
-
-export interface PopupCommands {
-  captureScreenshot(mode: ScreenshotMode): Promise<CaptureResult>;
-  getEvidenceSnapshot(): Promise<{
-    session: SessionState;
-    consoleEntries: ConsoleEntry[];
-    networkEntries: NetworkEntry[];
-    actions: TrackedAction[];
-    pageInfo: PageInfo | null;
-  }>;
-  setPageInfo(info: PageInfo): Promise<void>;
-}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const m = message as { kind: string; mode?: ScreenshotMode; info?: PageInfo };

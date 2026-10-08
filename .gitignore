@@ -1,5 +1,8 @@
+# Dependencies
 node_modules/
-.next/
+
+# Build artifacts
 dist/
+build/.next/
 build/
 *.log

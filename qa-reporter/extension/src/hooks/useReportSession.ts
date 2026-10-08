@@ -111,9 +111,21 @@ export function useReportSession(): ReportSession {
       }
       tabIdRef.current = tab.id;
       const sessionId = makeSessionId();
+      const base_errors: string[] = [];
 
-      setPhase('capturing');
-      await backgroundService.startSession(sessionId);
+      const settingsNow = await loadSettings();
+      setSettings(settingsNow);
+
+      if (!settingsNow.privacy.captureScreenshot) {
+        // Privacy: tester disabled screenshot collection → skip straight to form.
+        setPhase('evidence');
+      } else {
+        setPhase('capturing');
+      }
+      const startRes = await backgroundService.startSession(sessionId);
+      if (!startRes.networkCapturing && settingsNow.privacy.collectNetwork) {
+        base_errors.push('Network capture unavailable (DevTools open in this tab?); report continues without it.');
+      }
       // Tell content script too (it may not have been injected yet → ignore errors).
       try {
         await chrome.tabs.sendMessage(tab.id, { kind: 'START_SESSION', sessionId });
@@ -131,7 +143,7 @@ export function useReportSession(): ReportSession {
         page: {
           url: tab.url ?? '',
           title: tab.title ?? '',
-          referrer: tab.referrer ?? '',
+          referrer: (tab as unknown as { pendingUrl?: string }).pendingUrl ? document.referrer : '',
           timestamp: new Date().toISOString(),
           tabId: tab.id,
           windowId: tab.windowId,
@@ -140,7 +152,7 @@ export function useReportSession(): ReportSession {
         consoleEntries: [],
         networkEntries: [],
         actions: [],
-        errors: [],
+        errors: base_errors,
       };
       setReport(base);
       await saveDraft(base);

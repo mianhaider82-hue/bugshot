@@ -6,7 +6,6 @@
 
   "permissions": [
     "activeTab",
-    "scripting",
     "storage",
     "tabs",
     "debugger"
@@ -15,21 +14,21 @@
   "host_permissions": ["<all_urls>"],
 
   "background": {
-    "service_worker": "src/background/index.ts",
+    "service_worker": "background.js",
     "type": "module"
   },
 
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["src/content/index.ts"],
+      "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": false
     }
   ],
 
   "action": {
-    "default_popup": "index.html",
+    "default_popup": "popup/index.html",
     "default_title": "QA Reporter",
     "default_icon": {
       "16": "icons/icon-16.png",
