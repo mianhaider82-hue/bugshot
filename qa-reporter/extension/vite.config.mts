@@ -1,8 +1,8 @@
-import { defineConfig } from 'vite';
+import { build, defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { copyFileSync, readFileSync, writeFileSync } from 'fs';
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'fs';
 
 /**
  * QA Reporter – Vite build for a Chrome Extension (Manifest V3).
@@ -18,10 +18,10 @@ import { copyFileSync, readFileSync, writeFileSync } from 'fs';
  *      - content.js       -> content script
  *    A small `closeBundle` plugin relocates the deterministic bundles to the
  *    exact manifest paths and copies the manifest into dist (validated).
- * 3. Content scripts cannot be ES modules in current stable Chrome, so all
- *    bundles are emitted as classic scripts (format: 'iife', no exports).
- *    The background/content sources only import *types* + pure helpers, which
- *    Rollup inlines — keeping each bundle self-contained.
+ * 3. Content scripts cannot be ES modules in current stable Chrome, so the
+ *    content script is built in a separate pass as a self-contained classic
+ *    script (format: 'iife'). Rollup cannot emit IIFE for multi-entry builds,
+ *    so popup + background (declared `"type": "module"`) are emitted as ES.
  * 4. The manifest shipped in dist must reference BUILT files (background.js),
  *    never source .ts paths — the plugin below fails the build if it doesn't.
  */
@@ -37,21 +37,35 @@ function chromeBundlePlugin() {
     configResolved(cfg: { build: { outDir?: string } }) {
       capturedOutDir = resolve(rootDir, cfg.build.outDir ?? 'dist');
     },
-    closeBundle() {
+    async closeBundle() {
       const outDir = capturedOutDir ?? resolve(rootDir, 'dist');
 
-      // Deterministic single-file outputs land next to their chunk names.
-      const relocs: Array<[string, string]> = [
-        ['src/background/index.js', 'background.js'],
-        ['src/content/index.js', 'content.js'],
-      ];
-      for (const [from, to] of relocs) {
-        try {
-          copyFileSync(resolve(outDir, from), resolve(outDir, to));
-        } catch {
-          /* missing bundle → surfaced by manifest validation below */
-        }
+      // Deterministic single-file output lands next to its chunk name.
+      try {
+        copyFileSync(resolve(outDir, 'src/background/index.js'), resolve(outDir, 'background.js'));
+      } catch {
+        /* missing bundle → surfaced by manifest validation below */
       }
+
+      // Content script: separate single-entry build so it can be a classic IIFE.
+      await build({
+        configFile: false,
+        root: rootDir,
+        logLevel: 'warn',
+        build: {
+          target: 'chrome120',
+          outDir,
+          emptyOutDir: false,
+          copyPublicDir: false,
+          sourcemap: false,
+          lib: {
+            entry: resolve(rootDir, 'src/content/index.ts'),
+            formats: ['iife'],
+            name: 'QAReporterContent',
+            fileName: () => 'content.js',
+          },
+        },
+      });
 
       // Copy + validate manifest so it always references built files.
       const manifestRaw = readFileSync(resolve(rootDir, 'manifest.json'), 'utf8');
@@ -60,6 +74,10 @@ function chromeBundlePlugin() {
       const cs = (manifest.content_scripts as Array<{ js?: string[] }>) ?? [];
       if (!bg.service_worker?.endsWith('.js') || !cs[0]?.js?.[0]?.endsWith('.js')) {
         throw new Error('[chrome-bundle] manifest must reference built .js files');
+      }
+      const popup = (manifest.action as { default_popup?: string })?.default_popup;
+      if (popup && !existsSync(resolve(outDir, popup))) {
+        throw new Error(`[chrome-bundle] default_popup "${popup}" not found in build output`);
       }
       writeFileSync(resolve(outDir, 'manifest.json'), manifestRaw);
     },
@@ -80,16 +98,14 @@ export default defineConfig({
       input: {
         popup: resolve(rootDir, 'popup/popup.html'),
         background: resolve(rootDir, 'src/background/index.ts'),
-        content: resolve(rootDir, 'src/content/index.ts'),
       },
       output: {
-        format: 'iife',
+        format: 'es',
         inlineDynamicImports: false,
         entryFileNames: (chunk) => {
-          // background/content are relocated by the plugin after the build;
+          // background is relocated by the plugin after the build;
           // popup assets keep stable names referenced from popup.html.
           if (chunk.name === 'background') return 'src/background/index.js';
-          if (chunk.name === 'content') return 'src/content/index.js';
           return 'popup/assets/[name].js';
         },
         chunkFileNames: 'popup/assets/[name].js',
