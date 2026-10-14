@@ -1,22 +1,24 @@
 /**
- * Review screen – final stop before submission. Shows the (possibly AI-drafted)
+ * Review screen – final stop before export. Shows the (possibly AI-drafted)
  * report, all collected technical evidence, and lets the tester edit anything.
  * Requirement #12: the tester MUST be able to modify AI output before submit.
  */
 
 import { useState } from 'react';
-import type { BugReport, Priority, Severity } from '../types';
+import type { BugReport, Priority, ReportType, Severity } from '../types';
+import { REPORT_TYPE_LABELS } from '../types';
 import { hhmmss } from '../utils/format';
 import { Badge, Card, ErrorNotice } from './ui';
 
+export type ExportAction = 'sheets' | 'markdown' | 'json' | 'pdf' | 'local';
+
 interface Props {
   report: BugReport;
-  busy: string | null;
   error: string | null;
-  onSubmit: () => void;
+  aiEnabled: boolean;
+  onExport: (action: ExportAction) => void;
   onRegenerate: () => void;
-  onSaveLocal: () => void;
-  onCancel: () => void;
+  onBack: () => void;
   onUpdateForm: (patch: Partial<BugReport['form']>) => void;
 }
 
@@ -27,18 +29,15 @@ const PRIORITIES: Priority[] = ['P0', 'P1', 'P2', 'P3'];
 
 export function ReviewScreen({
   report,
-  busy,
   error,
-  onSubmit,
+  aiEnabled,
+  onExport,
   onRegenerate,
-  onSaveLocal,
-  onCancel,
+  onBack,
   onUpdateForm,
 }: Props): JSX.Element {
   const [tab, setTab] = useState<Tab>('report');
   const f = report.form;
-
-  if (busy) return <div className="content"><ErrorNotice message={error} /><div className="busy">{busy}</div></div>;
 
   const consoleErrors = report.consoleEntries.filter((c) => c.type === 'error' || c.type === 'exception' || c.type === 'rejection');
   const apiErrors = report.networkEntries.filter((n) => n.failed || n.status >= 400);
@@ -67,74 +66,104 @@ export function ReviewScreen({
       </div>
 
       {tab === 'report' ? (
-        <>
-          <Card title={`${report.id} · Bug report${report.ai ? ' · AI drafted' : ''}`}>
+        <div className="review-grid">
+          <div>
             {report.screenshot && (
-              <img
-                src={report.screenshot.dataUrl}
-                alt="annotated screenshot"
-                style={{ width: '100%', borderRadius: 8, border: '1px solid var(--border)', marginBottom: 10 }}
-              />
+              <img className="review-shot" src={report.screenshot.dataUrl} alt="annotated screenshot" />
             )}
-            <div className="field">
-              <label>Title</label>
-              <input type="text" value={f.title} onChange={(e) => onUpdateForm({ title: e.target.value })} />
-            </div>
-            <div className="btn-row" style={{ marginBottom: 10 }}>
-              <select value={f.severity} onChange={(e) => onUpdateForm({ severity: e.target.value as Severity })} className="btn" style={{ flex: 1 }}>
-                {SEVERITIES.map((s) => (
-                  <option key={s}>{s}</option>
-                ))}
-              </select>
-              <select value={f.priority} onChange={(e) => onUpdateForm({ priority: e.target.value as Priority })} className="btn" style={{ flex: 1 }}>
-                {PRIORITIES.map((p) => (
-                  <option key={p}>{p}</option>
-                ))}
-              </select>
-              <Badge severity={f.severity} />
-            </div>
-            <div className="field">
-              <label>Description</label>
-              <textarea value={f.description} onChange={(e) => onUpdateForm({ description: e.target.value })} />
-            </div>
-            <div className="field">
-              <label>Steps to reproduce</label>
-              {f.stepsToReproduce.map((step, i) => (
-                <input
-                  key={i}
-                  type="text"
-                  value={step}
-                  style={{ marginBottom: 4 }}
-                  onChange={(e) => {
-                    const next = [...f.stepsToReproduce];
-                    next[i] = e.target.value;
-                    onUpdateForm({ stepsToReproduce: next });
-                  }}
-                />
-              ))}
-            </div>
-            <div className="field">
-              <label>Expected result</label>
-              <textarea value={f.expectedResult} onChange={(e) => onUpdateForm({ expectedResult: e.target.value })} />
-            </div>
-            <div className="field">
-              <label>Actual result</label>
-              <textarea value={f.actualResult} onChange={(e) => onUpdateForm({ actualResult: e.target.value })} />
-            </div>
-            {report.ai?.possibleCause && (
-              <div className="notice info">
-                <strong>Possible cause (AI hypothesis, not confirmed):</strong> {report.ai.possibleCause}
-              </div>
-            )}
-          </Card>
-
-          <div className="btn-row">
-            <button className="btn" onClick={onCancel}>Cancel</button>
-            <button className="btn" onClick={onSaveLocal}>Save locally</button>
-            <button className="btn" onClick={onRegenerate} disabled={!report.ai}>↻ Regenerate</button>
-            <button className="btn primary" onClick={onSubmit}>Submit → Sheets</button>
+            <button className="btn small" style={{ marginTop: 8 }} onClick={onBack}>
+              ← Edit screenshot &amp; note
+            </button>
           </div>
-        </>
+
+          <div className="review-fields">
+            <Card title={`${report.id} · ${REPORT_TYPE_LABELS[f.reportType ?? 'bug']}${report.ai ? ' · AI drafted' : ''}`}>
+              <div className="field">
+                <label>Title</label>
+                <input type="text" value={f.title} onChange={(e) => onUpdateForm({ title: e.target.value })} />
+              </div>
+              <div className="btn-row" style={{ marginBottom: 10 }}>
+                <select value={f.reportType ?? 'bug'} onChange={(e) => onUpdateForm({ reportType: e.target.value as ReportType })} className="btn" style={{ flex: 1.4 }}>
+                  {(Object.keys(REPORT_TYPE_LABELS) as ReportType[]).map((t) => (
+                    <option key={t} value={t}>{REPORT_TYPE_LABELS[t]}</option>
+                  ))}
+                </select>
+                <select value={f.severity} onChange={(e) => onUpdateForm({ severity: e.target.value as Severity })} className="btn" style={{ flex: 1 }}>
+                  {SEVERITIES.map((s) => (
+                    <option key={s}>{s}</option>
+                  ))}
+                </select>
+                <select value={f.priority} onChange={(e) => onUpdateForm({ priority: e.target.value as Priority })} className="btn" style={{ flex: 1 }}>
+                  {PRIORITIES.map((p) => (
+                    <option key={p}>{p}</option>
+                  ))}
+                </select>
+                <Badge severity={f.severity} />
+              </div>
+              <div className="field">
+                <label>Description</label>
+                <textarea rows={4} value={f.description} onChange={(e) => onUpdateForm({ description: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Steps to reproduce</label>
+                {f.stepsToReproduce.map((step, i) => (
+                  <div key={i} className="step-row">
+                    <span className="step-num">{i + 1}.</span>
+                    <input
+                      type="text"
+                      value={step}
+                      onChange={(e) => {
+                        const next = [...f.stepsToReproduce];
+                        next[i] = e.target.value;
+                        onUpdateForm({ stepsToReproduce: next });
+                      }}
+                    />
+                    <button
+                      className="tool-btn"
+                      aria-label={`Remove step ${i + 1}`}
+                      onClick={() => onUpdateForm({ stepsToReproduce: f.stepsToReproduce.filter((_, j) => j !== i) })}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <button className="btn small" style={{ alignSelf: 'flex-start' }} onClick={() => onUpdateForm({ stepsToReproduce: [...f.stepsToReproduce, ''] })}>
+                  + Add step
+                </button>
+              </div>
+              <div className="field">
+                <label>Expected result</label>
+                <textarea value={f.expectedResult} onChange={(e) => onUpdateForm({ expectedResult: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Actual result</label>
+                <textarea value={f.actualResult} onChange={(e) => onUpdateForm({ actualResult: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Tester notes</label>
+                <textarea value={f.additionalNotes} onChange={(e) => onUpdateForm({ additionalNotes: e.target.value })} />
+              </div>
+              {report.ai?.possibleCause && (
+                <div className="notice info">
+                  <strong>Possible cause (AI hypothesis, not confirmed):</strong> {report.ai.possibleCause}
+                </div>
+              )}
+            </Card>
+
+            <Card title="Export">
+              <div className="export-grid">
+                <button className="btn primary" onClick={() => onExport('sheets')}>Add to Google Sheets</button>
+                <button className="btn" onClick={() => onExport('markdown')}>Copy as Markdown</button>
+                <button className="btn" onClick={() => onExport('pdf')}>Download PDF</button>
+                <button className="btn" onClick={() => onExport('json')}>Download JSON</button>
+              </div>
+              <div className="btn-row" style={{ marginTop: 8 }}>
+                <button className="btn small" onClick={onRegenerate} disabled={!aiEnabled}>↻ Regenerate AI draft</button>
+                <button className="btn small" onClick={() => onExport('local')}>Save &amp; close</button>
+              </div>
+            </Card>
+          </div>
+        </div>
       ) : (
         <>
           <Card title="Page & environment">

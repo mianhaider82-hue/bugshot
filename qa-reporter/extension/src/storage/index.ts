@@ -3,9 +3,9 @@
  *
  * Why chrome.storage.local (not sessionStorage/IndexedDB):
  *  - Survives browser restarts → enables draft recovery (requirement #19).
- *  - Quota: with "unlimitedStorage" absent we still get ~10MB which is enough
- *    for screenshots kept as data URLs for short-lived drafts. Large binaries
- *    are uploaded to backend storage in Phase 4; only the URL is persisted.
+ *  - Quota: the manifest requests "unlimitedStorage" because drafts keep
+ *    full-page screenshots as PNG data URLs, which easily exceed the default
+ *    10MB.
  */
 
 import type { AppSettings, BugReport } from '../types';
@@ -116,6 +116,10 @@ export async function saveDraft(draft: BugReport): Promise<void> {
       all.slice(0, 10).map((d) => ({ ...d, screenshot: undefined })),
     );
   }
+}
+
+export async function getDraft(sessionId: string): Promise<BugReport | undefined> {
+  return (await listDrafts()).find((d) => d.sessionId === sessionId);
 }
 
 export async function clearDraft(sessionId: string): Promise<void> {

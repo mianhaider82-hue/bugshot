@@ -1,0 +1,182 @@
+/**
+ * Editor tab layout – full-width overrides on top of the popup design system
+ * (popup/styles.css supplies the tokens, cards, buttons and fields).
+ */
+
+#root {
+  width: auto;
+  min-height: 100vh;
+  max-height: none;
+  overflow: visible;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+.small-text {
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.editor-app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.editor-app .header {
+  gap: 16px;
+  padding: 10px 20px;
+}
+.header-id {
+  font-weight: 600;
+  font-size: 13px;
+  margin-left: 6px;
+}
+.header-url {
+  font-size: 12px;
+  max-width: 30vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.header-url:hover {
+  text-decoration: underline;
+}
+
+.steps-bar {
+  display: flex;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.steps-bar li {
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: #eef2f7;
+}
+.steps-bar li.active {
+  background: var(--primary);
+  color: #fff;
+}
+.steps-bar li.past {
+  color: var(--ok);
+}
+
+.editor-main {
+  flex: 1;
+  padding: 20px;
+}
+.editor-center {
+  max-width: 520px;
+  margin: 60px auto;
+}
+.editor-center p {
+  font-size: 14px;
+}
+
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 20;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  box-shadow: var(--shadow);
+}
+
+/* ---------- step 1: edit ---------- */
+.edit-grid,
+.review-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 20px;
+  align-items: start;
+}
+.edit-canvas {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px 12px;
+}
+.edit-panel,
+.review-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: sticky;
+  top: 70px;
+}
+.type-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.type-chips .tool-btn {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.evidence-count .pill.bad {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* ---------- step 2: review ---------- */
+.review-grid {
+  grid-template-columns: minmax(0, 1fr) 460px;
+  margin-top: 12px;
+}
+.review-shot {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  display: block;
+}
+.review-fields {
+  position: static;
+}
+.step-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.step-row input {
+  flex: 1;
+}
+.step-num {
+  font-size: 12px;
+  color: var(--text-dim);
+  width: 18px;
+}
+.export-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.evidence-list {
+  max-height: 320px;
+}
+
+@media (max-width: 900px) {
+  .edit-grid,
+  .review-grid {
+    grid-template-columns: 1fr;
+  }
+  .edit-panel {
+    position: static;
+  }
+  .header-url,
+  .steps-bar {
+    display: none;
+  }
+  .editor-main {
+    padding: 16px;
+  }
+}

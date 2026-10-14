@@ -104,7 +104,17 @@ export type Priority = 'P0' | 'P1' | 'P2' | 'P3';
 
 export type ReportStatus = 'draft' | 'ready' | 'submitted' | 'failed';
 
+/** What the tester is reporting – steers the AI prompt and the Sheets row. */
+export type ReportType = 'bug' | 'design' | 'improvement';
+
+export const REPORT_TYPE_LABELS: Record<ReportType, string> = {
+  bug: 'Bug / error',
+  design: 'Design change',
+  improvement: 'Improvement',
+};
+
 export interface BugReportForm {
+  reportType: ReportType;
   title: string;
   description: string;
   stepsToReproduce: string[];
@@ -187,22 +197,19 @@ export const DEFAULT_SETTINGS: AppSettings = {
 /* Messaging (popup <-> background <-> content)                       */
 /* ------------------------------------------------------------------ */
 
+/** Messages handled by the background worker. */
 export type RuntimeMessage =
-  | { kind: 'START_SESSION'; sessionId: string }
-  | { kind: 'END_SESSION'; sessionId: string }
-  | { kind: 'CAPTURE_PAGE_INFO'; sessionId: string }
-  | { kind: 'PAGE_INFO_RESULT'; pageInfo: PageInfo; environment: EnvironmentInfo }
-  | { kind: 'CONSOLE_ENTRIES'; entries: ConsoleEntry[] }
-  | { kind: 'ACTION_TRACKING'; actions: TrackedAction[] }
-  | { kind: 'GET_CONSOLE_ENTRIES' }
-  | { kind: 'GET_ACTION_TRACKING' }
-  | { kind: 'CONSOLE_ENTRIES_RESULT'; entries: ConsoleEntry[] }
-  | { kind: 'ACTION_TRACKING_RESULT'; actions: TrackedAction[] }
+  | { kind: 'CAPTURE_AND_OPEN_EDITOR'; mode: ScreenshotMode }
   | { kind: 'PING' };
 
-export interface SessionState {
-  active: boolean;
-  sessionId: string | null;
-  startedAt: string | null;
-  tabId: number | null;
+/** Messages handled by the content script (sent with chrome.tabs.sendMessage). */
+export type ContentMessage = { kind: 'CAPTURE_PAGE_INFO' } | { kind: 'GET_BUFFERS' };
+
+/** Port name the popup opens so the worker knows when it is visible. */
+export const POPUP_PORT = 'qa-popup';
+
+/** Reply to CAPTURE_AND_OPEN_EDITOR. */
+export interface CaptureAndOpenResult {
+  ok: boolean;
+  error?: string;
 }

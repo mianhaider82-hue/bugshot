@@ -1,0 +1,32 @@
+{
+  "name": "qa-reporter-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "QA Reporter backend - Claude bug analysis + Google Sheets export",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "@googleapis/drive": "^26.0.2",
+    "@googleapis/sheets": "^18.1.1",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "google-auth-library": "^11.3.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

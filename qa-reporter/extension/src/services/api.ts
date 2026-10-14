@@ -6,22 +6,20 @@
 
 import type {
   AiAnalysis,
+  AppSettings,
   BugReport,
-  ConsoleEntry,
-  EnvironmentInfo,
-  NetworkEntry,
-  PageInfo,
-  ScreenshotData,
+  CaptureAndOpenResult,
+  RuntimeMessage,
   ScreenshotMode,
-  TrackedAction,
 } from '../types';
 import { redactBody, redactUrl, truncate } from '../utils/redaction';
+import { getAuthToken } from './session';
 
 /* ------------------------------------------------------------------ */
-/* Messaging helper                                                   */
+/* Background bridge                                                  */
 /* ------------------------------------------------------------------ */
 
-function sendMessage<T>(msg: unknown): Promise<T> {
+function sendMessage<T>(msg: RuntimeMessage): Promise<T> {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(msg, (response) => {
       const err = chrome.runtime.lastError;
@@ -31,114 +29,13 @@ function sendMessage<T>(msg: unknown): Promise<T> {
   });
 }
 
-/* ------------------------------------------------------------------ */
-/* Background bridge                                                  */
-/* ------------------------------------------------------------------ */
-
-interface CaptureResponse {
-  ok: boolean;
-  dataUrl?: string;
-  width?: number;
-  height?: number;
-  mode?: ScreenshotMode;
-  error?: string;
-}
-
-export interface EvidenceSnapshot {
-  consoleEntries: ConsoleEntry[];
-  networkEntries: NetworkEntry[];
-  actions: TrackedAction[];
-  pageInfo: PageInfo | null;
-}
-
 export const backgroundService = {
-  startSession(sessionId: string): Promise<{ ok: boolean; tabId: number | null; networkCapturing: boolean }> {
-    return sendMessage({ kind: 'START_SESSION', sessionId });
-  },
-  endSession(sessionId: string): Promise<{ ok: boolean }> {
-    return sendMessage({ kind: 'END_SESSION', sessionId });
-  },
-  async captureScreenshot(mode: ScreenshotMode): Promise<ScreenshotData> {
-    const r = await sendMessage<CaptureResponse>({ kind: 'POPUP_CAPTURE_SCREENSHOT', mode });
-    if (!r.ok || !r.dataUrl) throw new Error(r.error ?? 'Screenshot capture failed');
-    // Get real pixel dimensions by decoding the image.
-    const dims = await imageDimensions(r.dataUrl);
-    return {
-      dataUrl: r.dataUrl,
-      width: r.width ?? dims.width,
-      height: r.height ?? dims.height,
-      mode: r.mode ?? mode,
-      capturedAt: new Date().toISOString(),
-    };
-  },
-  async getEvidence(): Promise<EvidenceSnapshot> {
-    return sendMessage({ kind: 'POPUP_GET_EVIDENCE' });
-  },
-  setPageInfo(info: PageInfo): Promise<{ ok: boolean }> {
-    return sendMessage({ kind: 'POPUP_SET_PAGE_INFO', info });
+  /** Capture the active tab, snapshot evidence and open the editor tab. */
+  async captureAndOpenEditor(mode: ScreenshotMode): Promise<void> {
+    const r = await sendMessage<CaptureAndOpenResult>({ kind: 'CAPTURE_AND_OPEN_EDITOR', mode });
+    if (!r?.ok) throw new Error(r?.error ?? 'Screenshot capture failed');
   },
 };
-
-function imageDimensions(dataUrl: string): Promise<{ width: number; height: number }> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-    img.onerror = () => resolve({ width: 0, height: 0 });
-    img.src = dataUrl;
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* Page info via content script                                       */
-/* ------------------------------------------------------------------ */
-
-export async function capturePageContext(tabId: number): Promise<{
-  pageInfo: PageInfo;
-  environment: EnvironmentInfo;
-}> {
-  const fallbackEnv: EnvironmentInfo = {
-    browserName: 'Chrome',
-    browserVersion: 'unknown',
-    operatingSystem: 'unknown',
-    platform: navigator.platform,
-    screenResolution: `${screen.width}x${screen.height}`,
-    viewportWidth: window.innerWidth,
-    viewportHeight: window.innerHeight,
-    devicePixelRatio: window.devicePixelRatio,
-    userAgent: navigator.userAgent,
-    language: navigator.language,
-  };
-
-  let res: { pageInfo?: PageInfo; environment?: EnvironmentInfo };
-  try {
-    res = await chrome.tabs.sendMessage(tabId, { kind: 'CAPTURE_PAGE_INFO' });
-  } catch {
-    // Content script missing (e.g. chrome:// or injected after load) – use tab data.
-    const tab = await chrome.tabs.get(tabId);
-    return {
-      pageInfo: {
-        url: tab.url ?? '',
-        title: tab.title ?? '',
-        referrer: '',
-        timestamp: new Date().toISOString(),
-        tabId: tab.id ?? tabId,
-        windowId: tab.windowId,
-      },
-      environment: fallbackEnv,
-    };
-  }
-
-  const tab = await chrome.tabs.get(tabId);
-  const pageInfo: PageInfo = {
-    ...(res.pageInfo as PageInfo),
-    tabId: tab.id ?? tabId,
-    windowId: tab.windowId,
-    url: tab.url ?? res.pageInfo?.url ?? '',
-    title: tab.title ?? res.pageInfo?.title ?? '',
-    referrer: res.pageInfo?.referrer ?? '',
-  };
-  return { pageInfo, environment: res.environment ?? fallbackEnv };
-}
 
 /* ------------------------------------------------------------------ */
 /* Privacy pipeline – apply redaction to everything leaving the popup  */
@@ -169,11 +66,23 @@ export function sanitizeReport(report: BugReport, enabled: boolean): BugReport {
 }
 
 /* ------------------------------------------------------------------ */
-/* Backend API client (Phase 3). The OpenAI key NEVER lives here.     */
+/* Backend API client. The Claude API key NEVER lives here.           */
 /* ------------------------------------------------------------------ */
 
 export class BackendClient {
   constructor(private baseUrl: string) {}
+
+  private async post(path: string, body: unknown, timeoutMs: number): Promise<Response> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await getAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  }
 
   /** Health check used by Settings → "Backend connection status". */
   async health(): Promise<boolean> {
@@ -187,12 +96,7 @@ export class BackendClient {
 
   /** Ask the backend to run AI analysis over the collected evidence. */
   async analyze(report: BugReport): Promise<AiAnalysis> {
-    const r = await fetch(`${this.baseUrl}/api/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(toAiPayload(report)),
-      signal: AbortSignal.timeout(60_000),
-    });
+    const r = await this.post('/api/analyze', await toAiPayload(report), 120_000);
     if (!r.ok) {
       const text = await safeText(r);
       throw new Error(`AI analysis failed (${r.status}): ${text}`);
@@ -203,25 +107,28 @@ export class BackendClient {
 
   /** Upload screenshot; returns a hosted URL for the Sheets row. */
   async uploadScreenshot(reportId: string, dataUrl: string): Promise<string> {
-    const r = await fetch(`${this.baseUrl}/api/screenshot`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reportId, image: dataUrl }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!r.ok) throw new Error(`Screenshot upload failed (${r.status})`);
+    const r = await this.post('/api/screenshot', { reportId, image: dataUrl }, 60_000);
+    if (!r.ok) throw new Error(`Screenshot upload failed (${r.status}): ${await safeText(r)}`);
     const json = (await r.json()) as { url: string };
     return json.url;
   }
 
   /** Submit the final row to Google Sheets through the backend. */
-  async submitToSheets(report: BugReport, screenshotUrl?: string): Promise<{ rowId: string }> {
-    const r = await fetch(`${this.baseUrl}/api/sheets/submit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ report: toSheetPayload(report), screenshotUrl }),
-      signal: AbortSignal.timeout(30_000),
-    });
+  async submitToSheets(
+    report: BugReport,
+    settings: Pick<AppSettings, 'sheetsSpreadsheetId' | 'sheetsWorksheet'>,
+    screenshotUrl?: string,
+  ): Promise<{ rowId: string }> {
+    const r = await this.post(
+      '/api/sheets/submit',
+      {
+        report: toSheetPayload(report),
+        screenshotUrl,
+        spreadsheetId: settings.sheetsSpreadsheetId,
+        worksheet: settings.sheetsWorksheet,
+      },
+      30_000,
+    );
     if (!r.ok) {
       const text = await safeText(r);
       throw new Error(`Sheets submission failed (${r.status}): ${text}`);
@@ -239,18 +146,57 @@ async function safeText(r: Response): Promise<string> {
 }
 
 /** Trim a report down to what the AI actually needs (keeps payload sane). */
-function toAiPayload(report: BugReport) {
+async function toAiPayload(report: BugReport) {
   return {
+    reportType: report.form.reportType ?? 'bug',
+    testerNote: report.form.additionalNotes,
     page: report.page,
     environment: report.environment,
     form: report.form,
     consoleEntries: report.consoleEntries.slice(-50),
-    networkEntries: report.networkEntries.slice(-50),
+    networkEntries: report.networkEntries.slice(-80),
     actions: report.actions.slice(-50),
     screenshot: report.screenshot
-      ? { dataUrl: report.screenshot.dataUrl, mode: report.screenshot.mode }
+      ? { dataUrl: await prepareImageForAi(report.screenshot.dataUrl), mode: report.screenshot.mode }
       : null,
   };
+}
+
+/**
+ * The Claude API rejects images over 8000px on a side or ~5MB, and downscales
+ * anything large anyway. Tall full-page captures are shrunk to fit and sent as
+ * JPEG so the request stays small; the stored screenshot is untouched.
+ */
+async function prepareImageForAi(dataUrl: string): Promise<string> {
+  const MAX_SIDE = 7800;
+  const MAX_PIXELS = 12_000_000;
+  try {
+    const bmp = await createImageBitmap(await (await fetch(dataUrl)).blob());
+    const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height), Math.sqrt(MAX_PIXELS / (bmp.width * bmp.height)));
+    if (scale === 1 && dataUrl.length < 4_000_000) {
+      bmp.close();
+      return dataUrl;
+    }
+    const canvas = new OffscreenCanvas(Math.round(bmp.width * scale), Math.round(bmp.height * scale));
+    canvas.getContext('2d')?.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    bmp.close();
+    for (const quality of [0.85, 0.7, 0.5]) {
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+      if (blob.size < 3_700_000) return await blobToDataUrl(blob); // base64 adds ~33%
+    }
+    return await blobToDataUrl(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.35 }));
+  } catch {
+    return dataUrl;
+  }
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
 }
 
 function toSheetPayload(report: BugReport) {

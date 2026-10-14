@@ -4,7 +4,7 @@
  * On install/first use the extension registers an anonymous reporter session
  * with the backend (POST /api/auth/session) and stores the returned bearer
  * token in chrome.storage.local. The backend uses it for rate limiting and
- * attribution ("Reporter" column). Google/OpenAI secrets never touch this.
+ * attribution ("Reporter" column). Google/Anthropic secrets never touch this.
  */
 
 import { loadSettings } from '../storage';

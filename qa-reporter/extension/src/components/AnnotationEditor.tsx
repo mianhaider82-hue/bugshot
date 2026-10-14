@@ -12,20 +12,23 @@
  *    with smoothing disabled → a genuine mosaic that hides text.
  *  - Crop applies to the base image itself (destructive but redoable through
  *    the history of full editor states kept in `history` below).
- *  - The canvas works in image pixels; CSS scales it to popup width. Pointer
+ *  - The canvas works in image pixels; CSS scales it to the editor width. Pointer
  *    coordinates are converted via getBoundingClientRect so DPR/CSS scaling
  *    never shifts annotations.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ScreenshotMode } from '../types';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 
 export interface EditorProps {
   dataUrl: string;
-  mode: ScreenshotMode;
-  onSave: (dataUrl: string, width: number, height: number) => void;
-  onRetake: () => void;
-  onCancel: () => void;
+}
+
+/** Imperative API for the host page's own Save button. */
+export interface AnnotationEditorHandle {
+  /** Flatten base image + annotations into a PNG. Null until loaded. */
+  exportImage(): { dataUrl: string; width: number; height: number } | null;
+  /** True once the tester has drawn, cropped or added text. */
+  isDirty(): boolean;
 }
 
 type Tool = 'rect' | 'arrow' | 'pen' | 'text' | 'blur' | 'crop';
@@ -50,7 +53,10 @@ interface EditorState {
 
 const COLORS = ['#dc2626', '#2563eb', '#f59e0b', '#16a34a', '#0f172a', '#ffffff'];
 
-export function AnnotationEditor({ dataUrl, mode, onSave, onRetake, onCancel }: EditorProps): JSX.Element {
+export const AnnotationEditor = forwardRef<AnnotationEditorHandle, EditorProps>(function AnnotationEditor(
+  { dataUrl },
+  ref,
+): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [tool, setTool] = useState<Tool>('rect');
   const [color, setColor] = useState<string>(COLORS[0]);
@@ -326,15 +332,21 @@ export function AnnotationEditor({ dataUrl, mode, onSave, onRetake, onCancel }: 
     forceRender((n) => n + 1);
   }
 
-  /* ---------- save ---------- */
+  /* ---------- export ---------- */
 
-  function save(): void {
-    const st = stateRef.current;
-    const canvas = canvasRef.current;
-    if (!st || !canvas) return;
-    redraw();
-    onSave(canvas.toDataURL('image/png'), st.base.width, st.base.height);
-  }
+  useImperativeHandle(ref, () => ({
+    exportImage() {
+      const st = stateRef.current;
+      const canvas = canvasRef.current;
+      if (!st || !canvas) return null;
+      draftRef.current = null;
+      redraw();
+      return { dataUrl: canvas.toDataURL('image/png'), width: st.base.width, height: st.base.height };
+    },
+    isDirty() {
+      return historyRef.current.length > 0;
+    },
+  }));
 
   /* ---------- UI ---------- */
 
@@ -400,21 +412,9 @@ export function AnnotationEditor({ dataUrl, mode, onSave, onRetake, onCancel }: 
         style={{ display: ready ? 'block' : 'none' }}
       />
       {!ready && <div className="busy">Loading screenshot…</div>}
-
-      <div className="btn-row" style={{ marginTop: 10 }}>
-        <button className="btn" onClick={onRetake}>
-          Retake ({mode})
-        </button>
-        <button className="btn" onClick={onCancel}>
-          Cancel
-        </button>
-        <button className="btn primary" onClick={save} disabled={!ready}>
-          Use screenshot
-        </button>
-      </div>
     </div>
   );
-}
+});
 
 /* ---------- shape helpers ---------- */
 

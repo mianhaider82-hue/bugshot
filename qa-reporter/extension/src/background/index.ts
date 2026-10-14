@@ -2,87 +2,44 @@
  * QA Reporter – background service worker (MV3).
  *
  * Responsibilities:
- *  - Own the "report session" lifecycle (one active session at a time).
- *  - Capture screenshots via chrome.tabs.captureVisibleTab.
- *  - Buffer console entries & tracked actions forwarded by the content script.
- *  - Capture network evidence via chrome.debugger (CDP Network domain).
- *  - Persist drafts continuously so nothing is lost if the browser dies.
+ *  - Keep an always-on, per-tab ring buffer of network requests via
+ *    chrome.webRequest, so API failures that happened BEFORE the tester
+ *    clicked the extension icon end up in the report.
+ *  - While the popup is open, attach chrome.debugger (CDP Network + Log) to
+ *    the active tab for richer evidence: response bodies of failed requests
+ *    and the browser's own log (Log.enable replays entries collected so far).
+ *  - On "capture": take the screenshot, snapshot all evidence into a draft
+ *    report and open the editor page in a new tab next to the reported page.
  *
  * Documented Chrome API decisions
  * -------------------------------
- * 1. MV3 service workers are short-lived. We therefore keep in-memory buffers
- *    small and mirror every mutation into chrome.storage.local drafts; on
- *    worker restart we rehydrate from storage. This is the standard pattern
- *    for stateful MV3 extensions.
- * 2. Full-page screenshots: there is no first-party API. We use CDP
- *    Page.captureScreenshot with clip+scale over the document metrics that
- *    the content script reports ("where technically possible"). If the page
- *    is taller than Chrome's capture limits we fall back to viewport mode.
- * 3. Network capture uses chrome.debugger + CDP instead of webRequest because
- *    MV3 webRequest observers cannot read response bodies. The debugger banner
- *    is unavoidable UX; we attach only while a session is active and detach
- *    immediately when it ends to minimise intrusiveness.
- * 4. chrome.notifications is intentionally NOT used (requires extra
- *    permission); badge text communicates state instead.
+ * 1. MV3 service workers are short-lived. The webRequest buffer is mirrored
+ *    into chrome.storage.session (in-memory, cleared on browser restart) so a
+ *    worker restart doesn't lose it. The popup keeps a runtime Port open,
+ *    which keeps the worker alive while CDP is attached.
+ * 2. Full-page screenshots use CDP Page.captureScreenshot with
+ *    captureBeyondViewport (Chrome ≥ 108); fall back to viewport on failure.
+ * 3. webRequest cannot read response bodies in MV3, hence the debugger on top.
+ *    The debugger banner is unavoidable UX, so it is attached only while the
+ *    popup is open and detached right after the capture.
  */
 
 import type {
+  BugReport,
+  CaptureAndOpenResult,
   ConsoleEntry,
+  EnvironmentInfo,
   NetworkEntry,
   PageInfo,
   RuntimeMessage,
   ScreenshotMode,
-  SessionState,
   TrackedAction,
 } from '../types';
+import { POPUP_PORT } from '../types';
+import { loadSettings, nextBugId, saveDraft } from '../storage';
+import { makeSessionId } from '../utils/format';
 
-/* ------------------------------------------------------------------ */
-/* Session state (memory + storage mirror)                            */
-/* ------------------------------------------------------------------ */
-
-interface Buffers {
-  consoleEntries: ConsoleEntry[];
-  networkEntries: NetworkEntry[];
-  actions: TrackedAction[];
-}
-
-let session: SessionState = { active: false, sessionId: null, startedAt: null, tabId: null };
-let buffers: Buffers = { consoleEntries: [], networkEntries: [], actions: [] };
-let pageInfo: PageInfo | null = null;
-const MAX_BUFFER = 200; // bound memory in the worker
-
-const STATE_KEY = 'qa_session_state';
-const BUFFER_KEY = 'qa_session_buffers';
-
-/**
- * Documented decision: we mirror session state into chrome.storage.local
- * rather than chrome.storage.session so that a draft/session survives a full
- * browser restart (requirement #19). The data stored here is already bounded
- * and pre-redaction metadata only – the privacy pipeline runs before anything
- * leaves the device.
- */
-async function persistState(): Promise<void> {
-  try {
-    await chrome.storage.local.set({ [STATE_KEY]: session, [BUFFER_KEY]: buffers });
-  } catch {
-    /* storage quota – in-memory buffers remain authoritative for the session */
-  }
-}
-
-async function restoreState(): Promise<void> {
-  const obj = await chrome.storage.local.get([STATE_KEY, BUFFER_KEY]);
-  if (obj[STATE_KEY]) session = obj[STATE_KEY] as SessionState;
-  if (obj[BUFFER_KEY]) buffers = obj[BUFFER_KEY] as Buffers;
-}
-
-/* ------------------------------------------------------------------ */
-/* Badge helpers                                                      */
-/* ------------------------------------------------------------------ */
-
-function setBadge(text: string, color = '#2563eb'): void {
-  void chrome.action.setBadgeText({ text });
-  void chrome.action.setBadgeBackgroundColor({ color });
-}
+const MAX_BUFFER = 200; // bound memory per buffer
 
 /* ------------------------------------------------------------------ */
 /* Screenshot capture                                                 */
@@ -91,35 +48,24 @@ function setBadge(text: string, color = '#2563eb'): void {
 interface CaptureResult {
   ok: boolean;
   dataUrl?: string;
-  width?: number;
-  height?: number;
   error?: string;
   mode?: ScreenshotMode;
 }
 
-async function captureViewport(_tabId: number): Promise<CaptureResult> {
+async function captureViewport(windowId: number): Promise<CaptureResult> {
   try {
-    // Documented decision: captureVisibleTab acts on the *current window's*
-    // active tab; we pass no windowId because the reported tab is always the
-    // active tab of its window when a session starts from the popup.
-    const dataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
+    const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
     return { ok: true, dataUrl, mode: 'viewport' };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: msg(e) };
   }
 }
 
-/**
- * Full-page capture via CDP. The content script measures the document;
- * we scroll-stitch is unnecessary because captureScreenshot supports a clip
- * beyond the viewport when captureBeyondViewport=true (Chrome ≥ 108).
- */
-async function captureFullPage(tabId: number): Promise<CaptureResult> {
+async function captureFullPage(tabId: number, windowId: number): Promise<CaptureResult> {
   const target = { tabId };
   let attachedHere = false;
   try {
-    const existing = await chrome.debugger.getTargets();
-    if (!existing.some((t) => t.tabId === tabId && t.attached)) {
+    if (cdpTab !== tabId) {
       await chrome.debugger.attach(target, '1.3');
       attachedHere = true;
     }
@@ -140,19 +86,11 @@ async function captureFullPage(tabId: number): Promise<CaptureResult> {
       clip: { x: 0, y: 0, width, height, scale: 1 },
     })) as { data: string };
 
-    return {
-      ok: true,
-      dataUrl: `data:image/png;base64,${shot.data}`,
-      width,
-      height,
-      mode: 'fullpage',
-    };
+    return { ok: true, dataUrl: `data:image/png;base64,${shot.data}`, mode: 'fullpage' };
   } catch (e) {
     // Fall back to plain viewport capture rather than failing the report.
-    const fb = await captureViewport(tabId);
-    if (fb.ok) {
-      fb.error = `Full-page capture unavailable (${e instanceof Error ? e.message : e}); captured viewport instead.`;
-    }
+    const fb = await captureViewport(windowId);
+    if (fb.ok) fb.error = `Full-page capture unavailable (${msg(e)}); captured visible screen instead.`;
     return fb;
   } finally {
     if (attachedHere) {
@@ -165,181 +103,516 @@ async function captureFullPage(tabId: number): Promise<CaptureResult> {
   }
 }
 
+async function imageSize(dataUrl: string): Promise<{ width: number; height: number }> {
+  try {
+    const bmp = await createImageBitmap(await (await fetch(dataUrl)).blob());
+    const size = { width: bmp.width, height: bmp.height };
+    bmp.close();
+    return size;
+  } catch {
+    return { width: 0, height: 0 };
+  }
+}
+
 /* ------------------------------------------------------------------ */
-/* Network capture (chrome.debugger + CDP Network domain)             */
+/* Always-on network buffer (chrome.webRequest)                       */
+/* ------------------------------------------------------------------ */
+
+const NET_KEY = 'qa_tab_network';
+let tabNetwork: Record<string, NetworkEntry[]> = {};
+const netReady: Promise<void> = chrome.storage.session
+  .get(NET_KEY)
+  .then((obj) => {
+    tabNetwork = { ...((obj[NET_KEY] as Record<string, NetworkEntry[]>) ?? {}), ...tabNetwork };
+  })
+  .catch(() => undefined);
+
+let netPersistTimer: ReturnType<typeof setTimeout> | null = null;
+function persistNetwork(): void {
+  if (netPersistTimer) return;
+  netPersistTimer = setTimeout(() => {
+    netPersistTimer = null;
+    chrome.storage.session.set({ [NET_KEY]: tabNetwork }).catch(() => undefined);
+  }, 500);
+}
+
+const requestStarts = new Map<string, { start: number; body?: string }>();
+const ALWAYS_KEEP = new Set(['xmlhttprequest', 'main_frame', 'sub_frame']);
+
+function isOwnRequest(d: { tabId: number; initiator?: string }): boolean {
+  return d.tabId < 0 || (d.initiator ?? '').startsWith('chrome-extension://');
+}
+
+function recordWebRequest(tabId: number, entry: NetworkEntry): void {
+  void netReady.then(() => {
+    const list = (tabNetwork[tabId] ??= []);
+    list.push(entry);
+    if (list.length > MAX_BUFFER) list.splice(0, list.length - MAX_BUFFER);
+    persistNetwork();
+  });
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (isOwnRequest(d) || d.type !== 'xmlhttprequest') return undefined;
+    requestStarts.set(d.requestId, { start: d.timeStamp, body: decodeRequestBody(d.requestBody) });
+    if (requestStarts.size > 500) {
+      const oldest = requestStarts.keys().next().value;
+      if (oldest) requestStarts.delete(oldest);
+    }
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+  ['requestBody'],
+);
+
+chrome.webRequest.onCompleted.addListener(
+  (d) => {
+    const started = requestStarts.get(d.requestId);
+    requestStarts.delete(d.requestId);
+    if (isOwnRequest(d)) return;
+    if (!ALWAYS_KEEP.has(d.type) && d.statusCode < 400) return;
+    recordWebRequest(d.tabId, {
+      url: sanitizeUrlForLog(d.url),
+      method: d.method,
+      status: d.statusCode,
+      statusText: d.statusLine?.replace(/^HTTP\/[\d.]+\s+\d+\s*/, '') || undefined,
+      requestTimestamp: new Date(started?.start ?? d.timeStamp).toISOString(),
+      responseTimestamp: new Date(d.timeStamp).toISOString(),
+      durationMs: started ? Math.round(d.timeStamp - started.start) : undefined,
+      resourceType: resourceTypeLabel(d.type),
+      failed: false,
+      requestBody: started?.body,
+    });
+  },
+  { urls: ['<all_urls>'] },
+);
+
+chrome.webRequest.onErrorOccurred.addListener(
+  (d) => {
+    const started = requestStarts.get(d.requestId);
+    requestStarts.delete(d.requestId);
+    if (isOwnRequest(d)) return;
+    // Cancelled sub-resources (page navigated away) are noise.
+    if (!ALWAYS_KEEP.has(d.type) && d.error === 'net::ERR_ABORTED') return;
+    recordWebRequest(d.tabId, {
+      url: sanitizeUrlForLog(d.url),
+      method: d.method,
+      status: 0,
+      requestTimestamp: new Date(started?.start ?? d.timeStamp).toISOString(),
+      responseTimestamp: new Date(d.timeStamp).toISOString(),
+      durationMs: started ? Math.round(d.timeStamp - started.start) : undefined,
+      resourceType: resourceTypeLabel(d.type),
+      failed: true,
+      errorText: d.error,
+      requestBody: started?.body,
+    });
+  },
+  { urls: ['<all_urls>'] },
+);
+
+function decodeRequestBody(body: chrome.webRequest.WebRequestBody | null | undefined): string | undefined {
+  if (!body) return undefined;
+  try {
+    if (body.formData) return truncateSafe(JSON.stringify(body.formData));
+    const bytes = body.raw?.[0]?.bytes;
+    if (bytes) return truncateSafe(new TextDecoder().decode(bytes));
+  } catch {
+    /* binary payload → skip */
+  }
+  return undefined;
+}
+
+function resourceTypeLabel(type: string): string {
+  return type === 'xmlhttprequest' ? 'XHR/Fetch' : type === 'main_frame' ? 'Document' : type;
+}
+
+/* ------------------------------------------------------------------ */
+/* Debugger capture while the popup is open (CDP Network + Log)       */
 /* ------------------------------------------------------------------ */
 
 interface PendingRequest {
   url: string;
   method: string;
-  startMono: number; // epoch ms when request was seen
+  start: number;
   requestBody?: string;
   resourceType?: string;
   mimeType?: string;
 }
 
-/** requestId → index in buffers.networkEntries, for response-body enrichment. */
-const entryIndexByRequestId = new Map<string, number>();
-const pendingRequests = new Map<string, PendingRequest>();
-let networkAttachedTab: number | null = null;
+let cdpTab: number | null = null;
+let cdpNetwork: NetworkEntry[] = [];
+let cdpConsole: ConsoleEntry[] = [];
+const cdpIndexByRequestId = new Map<string, number>();
+const cdpPending = new Map<string, PendingRequest>();
 
-async function attachNetwork(tabId: number): Promise<boolean> {
-  if (networkAttachedTab === tabId) return true;
-  await detachNetwork();
+async function attachDebugger(tabId: number): Promise<boolean> {
+  if (cdpTab === tabId) return true;
+  await detachDebugger();
   try {
     await chrome.debugger.attach({ tabId }, '1.3');
+    cdpTab = tabId;
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {
       maxTotalBufferSize: 5_000_000,
       maxResourceBufferSize: 1_000_000,
     });
-    networkAttachedTab = tabId;
+    // Log.enable replays the entries the browser collected so far
+    // (failed resource loads, CSP / intervention warnings, …).
+    await chrome.debugger.sendCommand({ tabId }, 'Log.enable');
     return true;
   } catch (e) {
-    // Documented decision: DevTools open elsewhere → debugger attach fails.
-    // Network capture is non-fatal; the popup records it as a degraded error.
-    console.warn('[qa-reporter] network capture unavailable:', e);
+    // DevTools already open on this tab, or a restricted page.
+    console.warn('[qa-reporter] debugger unavailable:', e);
+    await detachDebugger();
     return false;
   }
 }
 
-async function detachNetwork(): Promise<void> {
-  if (networkAttachedTab == null) return;
+async function detachDebugger(): Promise<void> {
+  const tabId = cdpTab;
+  cdpTab = null;
+  cdpNetwork = [];
+  cdpConsole = [];
+  cdpPending.clear();
+  cdpIndexByRequestId.clear();
+  if (tabId == null) return;
   try {
-    await chrome.debugger.detach({ tabId: networkAttachedTab });
+    await chrome.debugger.detach({ tabId });
   } catch {
-    /* ignore */
+    /* already detached */
   }
-  networkAttachedTab = null;
-  pendingRequests.clear();
-  entryIndexByRequestId.clear();
 }
 
-chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (source.tabId !== networkAttachedTab || !session.active) return;
-  const p = params as Record<string, unknown>;
-
-  if (method === 'Network.requestWillBeSent') {
-    const req = p.request as { url: string; method: string; postData?: string };
-    pendingRequests.set(p.requestId as string, {
-      url: req.url,
-      method: req.method,
-      startMono: Date.now(),
-      requestBody: req.postData,
-      resourceType: p.type as string | undefined,
-    });
-  } else if (method === 'Network.responseReceived') {
-    const id = p.requestId as string;
-    const pending = pendingRequests.get(id);
-    const resp = p.response as { status: number; statusText?: string; mimeType?: string };
-    if (!pending) return;
-    pending.mimeType = resp.mimeType;
-    const entry: NetworkEntry = {
-      url: sanitizeUrlForLog(pending.url),
-      method: pending.method,
-      status: resp.status,
-      statusText: resp.statusText,
-      requestTimestamp: new Date(pending.startMono).toISOString(),
-      responseTimestamp: new Date().toISOString(),
-      durationMs: Date.now() - pending.startMono,
-      resourceType: pending.resourceType,
-      failed: false,
-      requestBody: pending.requestBody ? truncateSafe(pending.requestBody) : undefined,
-    };
-    pushNetwork(entry);
-    entryIndexByRequestId.set(id, buffers.networkEntries.length - 1);
-    // Error responses deserve the body snippet immediately – fetch while attached.
-    if (resp.status >= 400) {
-      void enrichResponseSnippet(id);
-    }
-  } else if (method === 'Network.loadingFinished') {
-    const id = p.requestId as string;
-    const idx = entryIndexByRequestId.get(id);
-    const pending = pendingRequests.get(id);
-    if (idx != null && pending && !buffers.networkEntries[idx]?.responseBody) {
-      void enrichResponseSnippet(id);
-    }
-    pendingRequests.delete(id);
-  } else if (method === 'Network.loadingFailed') {
-    finishRequest(p.requestId as string, (p.errorText as string) ?? 'net::ERR_FAILED');
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId === cdpTab) {
+    cdpTab = null;
   }
 });
 
-/** Fetch & attach a redacted-safe response snippet for one request (best effort). */
-async function enrichResponseSnippet(requestId: string): Promise<void> {
-  if (networkAttachedTab == null) return;
-  const idx = entryIndexByRequestId.get(requestId);
-  const pending = pendingRequests.get(requestId);
-  if (idx == null || !pending) return;
-  // Skip binary / streaming types deliberately (documented decision #3).
-  const mime = pending.mimeType ?? '';
-  if (/image|font|video|audio|octet-stream|event-stream|websocket/i.test(mime)) return;
-  const body = await fetchResponseBody(networkAttachedTab, requestId);
-  if (body && buffers.networkEntries[idx]) {
-    buffers.networkEntries[idx].responseBody = body;
-    await persistState();
-  }
-}
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (source.tabId == null || source.tabId !== cdpTab) return;
+  const p = params as Record<string, unknown>;
 
-function finishRequest(requestId: string, errorText?: string): void {
-  const pending = pendingRequests.get(requestId);
-  if (!pending) return;
-  pendingRequests.delete(requestId);
-  if (errorText) {
-    pushNetwork({
-      url: sanitizeUrlForLog(pending.url),
-      method: pending.method,
-      status: 0,
-      requestTimestamp: new Date(pending.startMono).toISOString(),
-      responseTimestamp: new Date().toISOString(),
-      durationMs: Date.now() - pending.startMono,
-      resourceType: pending.resourceType,
-      failed: true,
-      errorText,
-      requestBody: pending.requestBody ? truncateSafe(pending.requestBody) : undefined,
-    });
-  }
-}
-
-/**
- * Response bodies must be fetched while the debugger is still attached.
- * Binary / streaming / oversized responses are skipped deliberately.
- * (Documented decision: getResponseBody throws for evicted buffers, so this is
- * best-effort and only used for failed requests where the body matters most.)
- */
-async function fetchResponseBody(tabId: number, requestId: string): Promise<string | undefined> {
-  try {
-    const res = (await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', {
-      requestId,
-    })) as { body: string; base64Encoded: boolean };
-    if (res.base64Encoded) return undefined; // binary → skip (documented decision)
-    return truncateSafe(res.body);
-  } catch {
-    return undefined; // streamed/evicted body → best effort only
-  }
-}
-
-function pushNetwork(entry: NetworkEntry): void {
-  buffers.networkEntries.push(entry);
-  if (buffers.networkEntries.length > MAX_BUFFER) {
-    // Dropping the head shifts every recorded index by one – rebuild map.
-    const dropped = buffers.networkEntries.length - MAX_BUFFER;
-    buffers.networkEntries.splice(0, dropped);
-    for (const [k, v] of entryIndexByRequestId.entries()) {
-      const nv = v - dropped;
-      if (nv < 0) entryIndexByRequestId.delete(k);
-      else entryIndexByRequestId.set(k, nv);
+  switch (method) {
+    case 'Network.requestWillBeSent': {
+      const req = p.request as { url: string; method: string; postData?: string };
+      cdpPending.set(p.requestId as string, {
+        url: req.url,
+        method: req.method,
+        start: Date.now(),
+        requestBody: req.postData ? truncateSafe(req.postData) : undefined,
+        resourceType: p.type as string | undefined,
+      });
+      break;
+    }
+    case 'Network.responseReceived': {
+      const id = p.requestId as string;
+      const pending = cdpPending.get(id);
+      const resp = p.response as { status: number; statusText?: string; mimeType?: string };
+      if (!pending) return;
+      pending.mimeType = resp.mimeType;
+      cdpNetwork.push({
+        url: sanitizeUrlForLog(pending.url),
+        method: pending.method,
+        status: resp.status,
+        statusText: resp.statusText,
+        requestTimestamp: new Date(pending.start).toISOString(),
+        responseTimestamp: new Date().toISOString(),
+        durationMs: Date.now() - pending.start,
+        resourceType: pending.resourceType,
+        failed: false,
+        requestBody: pending.requestBody,
+      });
+      if (cdpNetwork.length > MAX_BUFFER) cdpNetwork.shift();
+      cdpIndexByRequestId.set(id, cdpNetwork.length - 1);
+      break;
+    }
+    case 'Network.loadingFinished': {
+      const id = p.requestId as string;
+      const pending = cdpPending.get(id);
+      const idx = cdpIndexByRequestId.get(id);
+      cdpPending.delete(id);
+      const entry = idx != null ? cdpNetwork[idx] : undefined;
+      // Error responses deserve the body snippet – fetch it while attached.
+      if (pending && entry && entry.status >= 400) void fetchResponseBody(id, pending.mimeType, entry);
+      break;
+    }
+    case 'Network.loadingFailed': {
+      const id = p.requestId as string;
+      const pending = cdpPending.get(id);
+      cdpPending.delete(id);
+      if (!pending) return;
+      cdpNetwork.push({
+        url: sanitizeUrlForLog(pending.url),
+        method: pending.method,
+        status: 0,
+        requestTimestamp: new Date(pending.start).toISOString(),
+        responseTimestamp: new Date().toISOString(),
+        durationMs: Date.now() - pending.start,
+        resourceType: pending.resourceType,
+        failed: true,
+        errorText: (p.errorText as string) ?? 'net::ERR_FAILED',
+        requestBody: pending.requestBody,
+      });
+      if (cdpNetwork.length > MAX_BUFFER) cdpNetwork.shift();
+      break;
+    }
+    case 'Log.entryAdded': {
+      const e = p.entry as { level: string; text: string; source: string; url?: string; lineNumber?: number; timestamp?: number };
+      if (e.level === 'verbose') return;
+      cdpConsole.push({
+        type: e.level === 'error' ? 'error' : e.level === 'warning' ? 'warn' : 'info',
+        message: truncateSafe(e.text),
+        source: e.url ? `${e.source}: ${fileName(e.url)}` : e.source,
+        line: e.lineNumber,
+        timestamp: new Date(e.timestamp ?? Date.now()).toISOString(),
+      });
+      if (cdpConsole.length > MAX_BUFFER) cdpConsole.shift();
+      break;
     }
   }
-  void persistState();
+});
+
+/** Best effort: binary / streaming / evicted bodies are skipped. */
+async function fetchResponseBody(requestId: string, mimeType: string | undefined, entry: NetworkEntry): Promise<void> {
+  if (cdpTab == null || /image|font|video|audio|octet-stream|event-stream/i.test(mimeType ?? '')) return;
+  try {
+    const res = (await chrome.debugger.sendCommand({ tabId: cdpTab }, 'Network.getResponseBody', {
+      requestId,
+    })) as { body: string; base64Encoded: boolean };
+    if (!res.base64Encoded) entry.responseBody = truncateSafe(res.body);
+  } catch {
+    /* evicted */
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Popup lifecycle: attach CDP while it is open                       */
+/* ------------------------------------------------------------------ */
+
+let captureInProgress = false;
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== POPUP_PORT) return;
+  void (async () => {
+    const settings = await loadSettings();
+    if (!settings.privacy.collectNetwork && !settings.privacy.collectConsole) return;
+    const tab = await activeTab();
+    if (tab?.id != null && isReportable(tab.url)) await attachDebugger(tab.id);
+  })();
+  port.onDisconnect.addListener(() => {
+    if (!captureInProgress) void detachDebugger();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Capture → draft → editor tab                                       */
+/* ------------------------------------------------------------------ */
+
+async function captureAndOpenEditor(mode: ScreenshotMode): Promise<CaptureAndOpenResult> {
+  const tab = await activeTab();
+  if (tab?.id == null) return { ok: false, error: 'No active tab to report on.' };
+  if (!isReportable(tab.url)) {
+    return { ok: false, error: 'QA Reporter cannot capture browser internal pages. Open a web page first.' };
+  }
+  const tabId = tab.id;
+  captureInProgress = true;
+  try {
+    const shot = mode === 'fullpage' ? await captureFullPage(tabId, tab.windowId) : await captureViewport(tab.windowId);
+    if (!shot.ok || !shot.dataUrl) return { ok: false, error: shot.error ?? 'Screenshot capture failed.' };
+
+    const settings = await loadSettings();
+    const errors: string[] = [];
+    if (shot.error) errors.push(shot.error);
+
+    const ctx = await pageContext(tab);
+    const page = await contentBuffers(tabId);
+    if (!page.available) {
+      errors.push('Console logs unavailable: reload the page once after installing the extension.');
+    }
+    await netReady;
+
+    const consoleEntries = settings.privacy.collectConsole
+      ? [...page.consoleEntries, ...cdpConsole].sort(byTime((c) => c.timestamp))
+      : [];
+    const networkEntries = settings.privacy.collectNetwork ? mergeNetwork(tabNetwork[tabId] ?? [], cdpNetwork) : [];
+    const actions = settings.privacy.trackActions ? page.actions : [];
+
+    const now = new Date().toISOString();
+    const report: BugReport = {
+      id: await nextBugId(),
+      sessionId: makeSessionId(),
+      createdAt: now,
+      updatedAt: now,
+      status: 'draft',
+      form: {
+        reportType: 'bug',
+        title: '',
+        description: '',
+        stepsToReproduce: [],
+        expectedResult: '',
+        actualResult: '',
+        severity: 'Medium',
+        priority: 'P2',
+        additionalNotes: '',
+      },
+      page: ctx.pageInfo,
+      environment: ctx.environment,
+      screenshot: {
+        dataUrl: shot.dataUrl,
+        mode: shot.mode ?? mode,
+        capturedAt: now,
+        ...(await imageSize(shot.dataUrl)),
+      },
+      consoleEntries,
+      networkEntries,
+      actions,
+      errors,
+    };
+    await saveDraft(report);
+    await detachDebugger();
+
+    await chrome.tabs.create({
+      url: chrome.runtime.getURL(`editor/editor.html?session=${encodeURIComponent(report.sessionId)}`),
+      index: tab.index + 1,
+      openerTabId: tabId,
+      windowId: tab.windowId,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: msg(e) };
+  } finally {
+    captureInProgress = false;
+  }
+}
+
+/** Prefer CDP entries (they carry response bodies); add webRequest-only ones. */
+function mergeNetwork(webReq: NetworkEntry[], cdp: NetworkEntry[]): NetworkEntry[] {
+  const merged = [...cdp];
+  for (const w of webReq) {
+    const t = Date.parse(w.requestTimestamp);
+    const dup = cdp.some(
+      (c) => c.url === w.url && c.method === w.method && Math.abs(Date.parse(c.requestTimestamp) - t) < 2000,
+    );
+    if (!dup) merged.push(w);
+  }
+  return merged.sort(byTime((n) => n.requestTimestamp)).slice(-MAX_BUFFER);
+}
+
+async function pageContext(tab: chrome.tabs.Tab): Promise<{ pageInfo: PageInfo; environment: EnvironmentInfo }> {
+  const tabId = tab.id ?? -1;
+  const fallback: PageInfo = {
+    url: tab.url ?? '',
+    title: tab.title ?? '',
+    referrer: '',
+    timestamp: new Date().toISOString(),
+    tabId,
+    windowId: tab.windowId,
+  };
+  try {
+    const res = (await chrome.tabs.sendMessage(tabId, { kind: 'CAPTURE_PAGE_INFO' })) as {
+      pageInfo: PageInfo;
+      environment: EnvironmentInfo;
+    };
+    return {
+      pageInfo: { ...res.pageInfo, tabId, windowId: tab.windowId, url: tab.url ?? res.pageInfo.url },
+      environment: res.environment,
+    };
+  } catch {
+    return {
+      pageInfo: fallback,
+      environment: {
+        browserName: 'Chrome',
+        browserVersion: navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? 'unknown',
+        operatingSystem: 'unknown',
+        platform: '',
+        screenResolution: 'unknown',
+        viewportWidth: tab.width ?? 0,
+        viewportHeight: tab.height ?? 0,
+        devicePixelRatio: 1,
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+      },
+    };
+  }
+}
+
+async function contentBuffers(
+  tabId: number,
+): Promise<{ available: boolean; consoleEntries: ConsoleEntry[]; actions: TrackedAction[] }> {
+  try {
+    const res = (await chrome.tabs.sendMessage(tabId, { kind: 'GET_BUFFERS' })) as {
+      consoleEntries: ConsoleEntry[];
+      actions: TrackedAction[];
+    };
+    return { available: true, consoleEntries: res.consoleEntries ?? [], actions: res.actions ?? [] };
+  } catch {
+    // Content script missing (tab opened before the extension was installed).
+    return { available: false, consoleEntries: [], actions: [] };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Message routing                                                    */
+/* ------------------------------------------------------------------ */
+
+chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResponse: (r: unknown) => void) => {
+  switch (message.kind) {
+    case 'CAPTURE_AND_OPEN_EDITOR':
+      void captureAndOpenEditor(message.mode).then(sendResponse);
+      return true; // async response
+    case 'PING':
+      sendResponse({ pong: true });
+      return false;
+    default:
+      // Not ours (e.g. a message meant for another listener) – stay silent.
+      return false;
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === cdpTab) void detachDebugger();
+  void netReady.then(() => {
+    if (tabNetwork[tabId]) {
+      delete tabNetwork[tabId];
+      persistNetwork();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+async function activeTab(): Promise<chrome.tabs.Tab | undefined> {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tab;
+}
+
+function isReportable(url: string | undefined): boolean {
+  return !!url && !/^(chrome|chrome-extension|edge|about|devtools|view-source):/i.test(url) &&
+    !url.startsWith('https://chromewebstore.google.com');
+}
+
+function byTime<T>(get: (x: T) => string): (a: T, b: T) => number {
+  return (a, b) => Date.parse(get(a)) - Date.parse(get(b));
 }
 
 function sanitizeUrlForLog(url: string): string {
-  // lightweight redaction here; full redaction pipeline lives in utils/redaction
-  // which the popup applies before AI/upload (keeps worker bundle simple).
+  // Lightweight redaction here; the full pipeline (utils/redaction) runs in
+  // the editor before anything is sent to the AI or Sheets.
   try {
     const u = new URL(url);
-    if (u.username || u.password) return `${u.protocol}//[REDACTED]@${u.host}${u.pathname}`;
+    if (u.username || u.password) return `${u.protocol}//[REDACTED]@${u.host}${u.pathname}${u.search}`;
     return url;
+  } catch {
+    return url;
+  }
+}
+
+function fileName(url: string): string {
+  try {
+    return new URL(url).pathname.split('/').pop() || url;
   } catch {
     return url;
   }
@@ -349,137 +622,6 @@ function truncateSafe(s: string): string {
   return s.length > 4000 ? `${s.slice(0, 4000)}… [truncated]` : s;
 }
 
-/* ------------------------------------------------------------------ */
-/* Message routing                                                    */
-/* ------------------------------------------------------------------ */
-
-const SESSION_MESSAGE_KINDS = new Set<string>([
-  'START_SESSION',
-  'END_SESSION',
-  'CONSOLE_ENTRIES',
-  'ACTION_TRACKING',
-  'GET_CONSOLE_ENTRIES',
-  'GET_ACTION_TRACKING',
-  'PING',
-]);
-
-chrome.runtime.onMessage.addListener(
-  (message: RuntimeMessage, sender, sendResponse: (r: unknown) => void) => {
-    // POPUP_* kinds are handled by the listener below. Only the first
-    // sendResponse wins, so we must not answer messages we don't own.
-    if (!SESSION_MESSAGE_KINDS.has(message.kind)) return false;
-    void (async () => {
-      switch (message.kind) {
-        case 'START_SESSION': {
-          session = {
-            active: true,
-            sessionId: message.sessionId,
-            startedAt: new Date().toISOString(),
-            tabId: sender.tab?.id ?? (await activeTabId()),
-          };
-          buffers = { consoleEntries: [], networkEntries: [], actions: [] };
-          pageInfo = null;
-          await persistState();
-          let networkCapturing = false;
-          if (session.tabId != null) networkCapturing = await attachNetwork(session.tabId);
-          setBadge('REC', '#dc2626');
-          sendResponse({ ok: true, tabId: session.tabId, networkCapturing });
-          break;
-        }
-
-        case 'END_SESSION': {
-          session = { active: false, sessionId: null, startedAt: null, tabId: null };
-          await persistState();
-          await detachNetwork();
-          setBadge('');
-          sendResponse({ ok: true });
-          break;
-        }
-
-        case 'CONSOLE_ENTRIES': {
-          buffers.consoleEntries.push(...message.entries);
-          if (buffers.consoleEntries.length > MAX_BUFFER) {
-            buffers.consoleEntries.splice(0, buffers.consoleEntries.length - MAX_BUFFER);
-          }
-          await persistState();
-          sendResponse({ ok: true });
-          break;
-        }
-
-        case 'ACTION_TRACKING': {
-          buffers.actions.push(...message.actions);
-          if (buffers.actions.length > MAX_BUFFER) {
-            buffers.actions.splice(0, buffers.actions.length - MAX_BUFFER);
-          }
-          await persistState();
-          sendResponse({ ok: true });
-          break;
-        }
-
-        case 'GET_CONSOLE_ENTRIES':
-          sendResponse({ entries: buffers.consoleEntries });
-          break;
-
-        case 'GET_ACTION_TRACKING':
-          sendResponse({ actions: buffers.actions });
-          break;
-
-        case 'PING':
-          sendResponse({ pong: true, session });
-          break;
-
-      }
-    })();
-    return true; // keep channel open for async sendResponse
-  },
-);
-
-async function activeTabId(): Promise<number | null> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab?.id ?? null;
+function msg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
-
-/* ------------------------------------------------------------------ */
-/* External messages from popup (screenshots, evidence snapshot)      */
-/* ------------------------------------------------------------------ */
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  const m = message as { kind: string; mode?: ScreenshotMode; info?: PageInfo };
-  if (m.kind === 'POPUP_CAPTURE_SCREENSHOT') {
-    void (async () => {
-      const tabId = session.tabId ?? (await activeTabId());
-      if (tabId == null) return sendResponse({ ok: false, error: 'No active tab' });
-      const result =
-        m.mode === 'fullpage' ? await captureFullPage(tabId) : await captureViewport(tabId);
-      sendResponse(result);
-    })();
-    return true;
-  }
-  if (m.kind === 'POPUP_GET_EVIDENCE') {
-    sendResponse({
-      session,
-      consoleEntries: buffers.consoleEntries,
-      networkEntries: buffers.networkEntries,
-      actions: buffers.actions,
-      pageInfo,
-    });
-    return false;
-  }
-  if (m.kind === 'POPUP_SET_PAGE_INFO' && m.info) {
-    pageInfo = m.info;
-    void persistState();
-    sendResponse({ ok: true });
-    return false;
-  }
-  return false;
-});
-
-/* Clean up debugger when the reported tab closes/navigates away hard. */
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === networkAttachedTab) void detachNetwork();
-});
-
-/* Worker startup: rehydrate last known session state. */
-chrome.runtime.onInstalled.addListener(() => void restoreState());
-chrome.runtime.onStartup.addListener(() => void restoreState());
-void restoreState();

@@ -5,33 +5,35 @@
  * install console/error hooks BEFORE any page script runs (otherwise early
  * errors are invisible to us).
  *
- * What it does while a report session is ACTIVE:
- *  - Buffers console.error/warn/info, window.onerror, unhandledrejection.
- *  - Tracks user actions (click / input / select / submit) with privacy rules.
- *  - Reports navigation events.
- *  - Answers CAPTURE_PAGE_INFO with URL + environment metrics.
+ * What it does (always on, every page):
+ *  - Keeps a local ring buffer of console.error/warn/info, window.onerror and
+ *    unhandledrejection, so errors that happened BEFORE the tester clicked
+ *    the extension icon are still available for the report.
+ *  - Keeps a ring buffer of user actions (click / input / select / submit /
+ *    navigation) with privacy rules.
+ *  - Answers GET_BUFFERS (the background snapshots them at capture time) and
+ *    CAPTURE_PAGE_INFO with URL + environment metrics.
  *
  * Privacy decisions (documented):
  *  - Input values are only captured for non-sensitive fields; password/email/
  *    tel/search inputs record the field NAME and "[REDACTED]" or nothing.
- *  - Batching: entries are flushed to the worker every 1s or when 20 items
- *    accumulate, whichever comes first, to keep messaging cheap.
- *  - When no session is active the script is completely passive (it only
- *    listens for messages), satisfying "only capture logs relevant to the
- *    current reporting session".
+ *  - Buffers never leave the page on their own: nothing is sent anywhere
+ *    until the tester takes a screenshot, and the redaction pipeline runs
+ *    before anything leaves the device.
  */
 
 import type {
   ConsoleEntry,
   EnvironmentInfo,
   PageInfo,
-  RuntimeMessage,
+  ContentMessage,
   TrackedAction,
 } from '../types';
 import { cssPath, describeElement } from '../utils/format';
 import { REDACTED, isSensitiveFieldName, redactBody } from '../utils/redaction';
 
-let sessionActive = false;
+const MAX_CONSOLE = 200;
+const MAX_ACTIONS = 100;
 
 /* ------------------------------------------------------------------ */
 /* Console hooking                                                    */
@@ -76,9 +78,8 @@ function fileName(url: string): string {
 }
 
 function pushConsole(entry: ConsoleEntry): void {
-  if (!sessionActive) return;
   consoleBuffer.push(entry);
-  scheduleFlush();
+  if (consoleBuffer.length > MAX_CONSOLE) consoleBuffer.splice(0, consoleBuffer.length - MAX_CONSOLE);
 }
 
 function formatArgs(args: unknown[]): string {
@@ -105,7 +106,6 @@ for (const level of ['error', 'warn', 'info'] as const) {
   const original = native[level].bind(console);
   console[level] = (...args: unknown[]) => {
     original(...args);
-    if (!sessionActive) return;
     const loc = callerFromStack();
     pushConsole({
       type: level,
@@ -157,16 +157,15 @@ window.addEventListener('unhandledrejection', (e) => {
 const SENSITIVE_INPUT_TYPES = new Set(['password', 'email', 'tel', 'search', 'number']);
 
 function pushAction(action: TrackedAction): void {
-  if (!sessionActive) return;
   actionBuffer.push(action);
-  scheduleFlush();
+  if (actionBuffer.length > MAX_ACTIONS) actionBuffer.splice(0, actionBuffer.length - MAX_ACTIONS);
 }
 
 document.addEventListener(
   'click',
   (e) => {
     const el = e.target as Element | null;
-    if (!el || !sessionActive) return;
+    if (!el) return;
     pushAction({
       type: 'click',
       label: `Clicked "${describeElement(el)}"`,
@@ -229,7 +228,7 @@ document.addEventListener(
   'submit',
   (e) => {
     const form = e.target as HTMLFormElement | null;
-    if (!form || !sessionActive) return;
+    if (!form) return;
     pushAction({
       type: 'form-submit',
       label: `Submitted form "${form.getAttribute('name') || form.id || describeElement(form)}"`,
@@ -258,9 +257,7 @@ history.pushState = function (...args: Parameters<typeof origPushState>) {
 };
 window.addEventListener('popstate', () => reportNavigation(`Navigated back/forward to ${location.pathname}`));
 
-/* On first run inside a session, announce the page load as a navigation.
- * NOTE: this fires even when sessionActive is false (pushConsole/pushAction
- * drop it) – kept intentionally so the code path stays uniform. */
+/* Announce the page load as the first entry of the action timeline. */
 reportNavigation(`Page loaded: ${location.pathname}`);
 
 /* ------------------------------------------------------------------ */
@@ -275,7 +272,7 @@ reportNavigation(`Page loaded: ${location.pathname}`);
  * The popup therefore checks visibility before offering full-page mode.
  */
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && sessionActive) {
+  if (!document.hidden) {
     pushAction({
       type: 'navigation',
       label: 'Tab became visible',
@@ -286,47 +283,14 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Flushing buffers to the service worker                             */
-/* ------------------------------------------------------------------ */
-
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-function scheduleFlush(): void {
-  if (consoleBuffer.length + actionBuffer.length >= 20) {
-    void flush();
-    return;
-  }
-  if (flushTimer) return;
-  flushTimer = setTimeout(() => void flush(), 1000);
-}
-
-async function flush(): Promise<void> {
-  flushTimer = null;
-  const c = consoleBuffer.splice(0);
-  const a = actionBuffer.splice(0);
-  try {
-    if (c.length) await chrome.runtime.sendMessage({ kind: 'CONSOLE_ENTRIES', entries: c });
-    if (a.length) await chrome.runtime.sendMessage({ kind: 'ACTION_TRACKING', actions: a });
-  } catch {
-    // Worker restarting – drop batch; next flush will include newer data.
-  }
-}
-
-/* ------------------------------------------------------------------ */
 /* Inbound messages                                                   */
 /* ------------------------------------------------------------------ */
 
 chrome.runtime.onMessage.addListener(
-  (message: RuntimeMessage, _sender, sendResponse: (r?: unknown) => void) => {
+  (message: ContentMessage, _sender, sendResponse: (r?: unknown) => void) => {
     switch (message.kind) {
-      case 'START_SESSION':
-        sessionActive = true;
-        sendResponse({ ok: true });
-        return false;
-      case 'END_SESSION':
-        sessionActive = false;
-        void flush();
-        sendResponse({ ok: true });
+      case 'GET_BUFFERS':
+        sendResponse({ consoleEntries: [...consoleBuffer], actions: [...actionBuffer] });
         return false;
       case 'CAPTURE_PAGE_INFO': {
         const pageInfo: PageInfo = {

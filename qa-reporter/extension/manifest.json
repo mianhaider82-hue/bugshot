@@ -1,20 +1,22 @@
 {
   "manifest_version": 3,
   "name": "QA Reporter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Report website bugs with one click: screenshot capture, automatic technical evidence collection, AI bug reports, Google Sheets export.",
 
   "permissions": [
     "activeTab",
     "storage",
     "tabs",
-    "debugger"
+    "debugger",
+    "webRequest",
+    "unlimitedStorage"
   ],
 
   "host_permissions": ["<all_urls>"],
 
   "background": {
-    "service_worker": "background.js",
+    "service_worker": "src/background/index.js",
     "type": "module"
   },
 
