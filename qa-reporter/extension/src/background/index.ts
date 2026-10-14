@@ -353,8 +353,21 @@ function truncateSafe(s: string): string {
 /* Message routing                                                    */
 /* ------------------------------------------------------------------ */
 
+const SESSION_MESSAGE_KINDS = new Set<string>([
+  'START_SESSION',
+  'END_SESSION',
+  'CONSOLE_ENTRIES',
+  'ACTION_TRACKING',
+  'GET_CONSOLE_ENTRIES',
+  'GET_ACTION_TRACKING',
+  'PING',
+]);
+
 chrome.runtime.onMessage.addListener(
   (message: RuntimeMessage, sender, sendResponse: (r: unknown) => void) => {
+    // POPUP_* kinds are handled by the listener below. Only the first
+    // sendResponse wins, so we must not answer messages we don't own.
+    if (!SESSION_MESSAGE_KINDS.has(message.kind)) return false;
     void (async () => {
       switch (message.kind) {
         case 'START_SESSION': {
@@ -415,8 +428,6 @@ chrome.runtime.onMessage.addListener(
           sendResponse({ pong: true, session });
           break;
 
-        default:
-          sendResponse({ ok: false, error: 'unknown message' });
       }
     })();
     return true; // keep channel open for async sendResponse
