@@ -141,7 +141,7 @@ export function SettingsScreen({ settings, onSave, onClose }: Props): JSX.Elemen
           <input type="checkbox" checked={draft.aiEnabled} onChange={(e) => setDraft({ ...draft, aiEnabled: e.target.checked })} />
         </div>
         <p style={{ fontSize: 12, color: 'var(--text-dim)', margin: 0 }}>
-          The Claude API key lives only on the backend. The extension never sees it.
+          The OpenAI API key lives only on the backend. The extension never sees it.
         </p>
       </Card>
 

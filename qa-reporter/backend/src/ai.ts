@@ -1,14 +1,14 @@
 /**
- * Claude analysis: screenshot + tester note + technical evidence → a
+ * OpenAI analysis: screenshot + tester note + technical evidence → a
  * structured bug report (title, description, steps, expected/actual, …).
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
+import OpenAI from 'openai';
+import { zodResponseFormat } from 'openai/helpers/zod';
 import { z } from 'zod';
 import { config } from './config.js';
 
-const client = new Anthropic();
+const client = new OpenAI();
 
 export const AnalysisSchema = z.object({
   title: z.string().describe('Short, specific report title (max ~80 chars)'),
@@ -86,39 +86,34 @@ function evidenceText(req: AnalyzeRequest): string {
     .join('\n\n');
 }
 
-function imageBlock(dataUrl: string): Anthropic.Beta.BetaImageBlockParam | null {
-  const m = dataUrl.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,(.+)$/);
-  if (!m) return null;
-  return {
-    type: 'image',
-    source: { type: 'base64', media_type: m[1] as 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif', data: m[2] },
-  };
-}
+const SUPPORTED_IMAGE = /^data:image\/(?:png|jpeg|webp|gif);base64,/;
 
 export class AiRefusalError extends Error {}
 
 export async function analyzeReport(req: AnalyzeRequest): Promise<Analysis> {
-  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
-  const img = req.screenshot ? imageBlock(req.screenshot.dataUrl) : null;
-  if (img) content.push(img, { type: 'text', text: `Screenshot mode: ${req.screenshot?.mode}` });
+  const content: OpenAI.Chat.ChatCompletionContentPart[] = [];
+  if (req.screenshot && SUPPORTED_IMAGE.test(req.screenshot.dataUrl)) {
+    content.push(
+      { type: 'image_url', image_url: { url: req.screenshot.dataUrl, detail: 'high' } },
+      { type: 'text', text: `Screenshot mode: ${req.screenshot.mode}` },
+    );
+  }
   content.push({ type: 'text', text: evidenceText(req) });
 
-  const response = await client.beta.messages.parse({
-    model: config.claudeModel,
-    max_tokens: 16000,
-    // Safety classifiers can decline; re-run on Anthropic's recommended fallback model.
-    betas: ['server-side-fallback-2026-07-01'],
-    fallbacks: 'default',
-    output_config: { effort: 'medium', format: betaZodOutputFormat(AnalysisSchema) },
-    system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content }],
+  const completion = await client.chat.completions.parse({
+    model: config.openaiModel,
+    max_completion_tokens: 4096,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content },
+    ],
+    response_format: zodResponseFormat(AnalysisSchema, 'qa_report'),
   });
 
-  if (response.stop_reason === 'refusal') {
-    throw new AiRefusalError(response.stop_details?.explanation ?? 'The AI declined to analyze this report.');
+  const choice = completion.choices[0];
+  if (choice?.message.refusal) throw new AiRefusalError(choice.message.refusal);
+  if (!choice?.message.parsed) {
+    throw new Error(`AI returned no structured output (finish_reason: ${choice?.finish_reason})`);
   }
-  if (!response.parsed_output) {
-    throw new Error(`AI returned no structured output (stop_reason: ${response.stop_reason})`);
-  }
-  return response.parsed_output;
+  return choice.message.parsed;
 }

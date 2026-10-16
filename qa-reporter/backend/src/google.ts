@@ -1,12 +1,10 @@
 /**
  * Google OAuth + Sheets + Drive.
  *
- * The backend is the OAuth client; tokens never reach the extension. The
- * spreadsheet row links to the screenshot stored in the same account's Drive
- * (private – viewers need access to that Drive file).
+ * The backend is the OAuth client; tokens never reach the extension.
+ * Screenshots are stored on Cloudinary (storage.ts), not in Drive.
  */
 
-import { Readable } from 'node:stream';
 import { OAuth2Client } from 'google-auth-library';
 import { sheets as sheetsApi } from '@googleapis/sheets';
 import { drive as driveApi } from '@googleapis/drive';
@@ -15,12 +13,9 @@ import { clearGoogleTokens, getGoogleTokens, setGoogleTokens } from './store.js'
 
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/drive.file', // screenshots uploaded by this app
   'https://www.googleapis.com/auth/drive.metadata.readonly', // list spreadsheets in Settings
   'https://www.googleapis.com/auth/userinfo.email',
 ];
-
-const SCREENSHOT_FOLDER = 'QA Reporter Screenshots';
 
 export class NotConnectedError extends Error {
   constructor() {
@@ -84,38 +79,6 @@ export async function listSpreadsheets(): Promise<Array<{ id: string; title: str
     fields: 'files(id,name)',
   });
   return (res.data.files ?? []).map((f) => ({ id: f.id ?? '', title: f.name ?? '(untitled)' }));
-}
-
-async function screenshotFolderId(): Promise<string> {
-  const drive = driveApi({ version: 'v3', auth: authedClient() });
-  const found = await drive.files.list({
-    q: `mimeType='application/vnd.google-apps.folder' and name='${SCREENSHOT_FOLDER}' and trashed=false`,
-    fields: 'files(id)',
-    pageSize: 1,
-  });
-  const existing = found.data.files?.[0]?.id;
-  if (existing) return existing;
-  const created = await drive.files.create({
-    requestBody: { name: SCREENSHOT_FOLDER, mimeType: 'application/vnd.google-apps.folder' },
-    fields: 'id',
-  });
-  return created.data.id ?? '';
-}
-
-export async function uploadScreenshot(reportId: string, dataUrl: string): Promise<string> {
-  const m = dataUrl.match(/^data:(image\/[a-z]+);base64,(.+)$/);
-  if (!m) throw new Error('image must be a base64 data URL');
-  const [, mimeType, b64] = m;
-  const drive = driveApi({ version: 'v3', auth: authedClient() });
-  const res = await drive.files.create({
-    requestBody: {
-      name: `${reportId}-${new Date().toISOString().replace(/[:.]/g, '-')}.${mimeType.split('/')[1]}`,
-      parents: [await screenshotFolderId()],
-    },
-    media: { mimeType, body: Readable.from(Buffer.from(b64, 'base64')) },
-    fields: 'id,webViewLink',
-  });
-  return res.data.webViewLink ?? `https://drive.google.com/file/d/${res.data.id}/view`;
 }
 
 /* ------------------------------------------------------------------ */

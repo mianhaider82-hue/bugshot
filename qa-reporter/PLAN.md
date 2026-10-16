@@ -4,10 +4,10 @@
 
 `qa-reporter/extension/` already contains most of the Chrome extension: an MV3 + React + Vite popup, a background worker, a content script, an annotation editor, redaction and local drafts. It was built against a backend that doesn't exist yet, and it has blocking bugs. This plan does three things:
 1. Fixes the extension and closes its gaps against the spec.
-2. Builds the missing `qa-reporter/backend/` (Node + TypeScript, Express, OpenAI, Google OAuth/Sheets, **Firebase Firestore** for persistence, **local disk** for screenshots).
+2. Builds the missing `qa-reporter/backend/` (Node + TypeScript, Express, OpenAI, Google OAuth/Sheets, **Firebase Firestore** for persistence, **Cloudinary** for screenshots).
 3. Adds the deliverables: tests, lint, docs and the testing checklist.
 
-User decisions: screenshots go on backend local disk, and persistence uses Firebase (Firestore via `firebase-admin`).
+User decisions: screenshots go to Cloudinary, AI uses OpenAI `gpt-4o`, and persistence uses Firebase (Firestore via `firebase-admin`).
 
 ---
 
@@ -73,7 +73,7 @@ backend/
     services/               # reportService (row mapping), bugIdService
     ai/                     # openaiClient, prompt.ts, schema.ts (zod for AI JSON)
     google/                 # oauth.ts, sheets.ts
-    storage/                # firestore.ts, tokenStore.ts, screenshotStore.ts (disk)
+    storage/                # firestore.ts, tokenStore.ts, (screenshots → Cloudinary)
     utils/                  # crypto (AES-256-GCM), redact, errors
   test/
   .env.example
@@ -91,8 +91,7 @@ backend/
 | POST | `/api/auth/google/logout` | Revoke the token and delete it |
 | POST | `/api/bugs/next-id` | Firestore transaction on `counters/bugs` → `BUG-0001`… |
 | POST | `/api/analyze` | Validate the payload, re-run server-side redaction, call OpenAI, validate the output, return `{analysis}` |
-| POST | `/api/screenshot` | Validate the PNG/JPEG data URL (≤ 8 MB, magic bytes) and write `SCREENSHOT_DIR/<bugId>-<rand>.png`. Return `${PUBLIC_BASE_URL}/screenshots/<file>` |
-| GET | `/screenshots/:file` | Static serve with a strict filename regex, `Content-Type` image, `nosniff` |
+| POST | `/api/screenshot` | Validate the PNG/JPEG data URL and upload it to Cloudinary. Return the `secure_url` |
 | GET | `/api/sheets/list` | Drive files list, `mimeType=spreadsheet` |
 | GET | `/api/sheets/worksheets` | Tab titles |
 | POST | `/api/sheets/submit` | Assign or confirm the bug ID, ensure the header row exists, append the row with the spec #13 columns. Return `{rowId, bugId}` |
@@ -125,11 +124,11 @@ backend/
 ## Part C — Docs and deliverables (spec #23)
 - `qa-reporter/README.md`, covering:
   - architecture diagram
-  - setup for OpenAI, Google Cloud (OAuth client, consent screen, Sheets and Drive APIs, redirect URI), Firebase (project + service account) and the screenshot dir
+  - setup for OpenAI, Google Cloud (OAuth client, consent screen, Sheets and Drive APIs, redirect URI), Firebase (project + service account) and Cloudinary credentials
   - `.env.example` walkthrough
   - build steps for both packages
   - Chrome developer-mode install
-  - production deploy (Node host with a **persistent volume** for screenshots, HTTPS, set `PUBLIC_BASE_URL` / `EXTENSION_ID`, pin the extension key in the manifest so the ID is stable)
+  - production deploy (Node host, HTTPS, set `PUBLIC_BASE_URL` / `EXTENSION_ID`, pin the extension key in the manifest so the ID is stable)
   - troubleshooting: debugger banner, DevTools conflict, reloading tabs
 - `docs/TESTING_CHECKLIST.md`: a manual end-to-end checklist per phase and per failure mode (backend down, AI fails, Sheets fails, quota, offline, draft recovery).
 - Root `package.json` with npm workspaces (`extension`, `backend`) and `dev`, `build`, `test`, `lint` scripts. Remove the stray empty `qa-reporter/package-lock.json`.

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "QA Reporter backend - Claude bug analysis + Google Sheets export",
+  "description": "QA Reporter backend - OpenAI GPT-4o bug analysis, Cloudinary screenshots, Google Sheets export",
   "scripts": {
     "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
     "build": "tsc",
@@ -14,12 +14,13 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.133.0",
     "@googleapis/drive": "^26.0.2",
     "@googleapis/sheets": "^18.1.1",
+    "cloudinary": "^2.11.0",
     "cors": "^2.8.6",
     "express": "^5.3.0",
     "google-auth-library": "^11.3.0",
+    "openai": "^7.34.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {

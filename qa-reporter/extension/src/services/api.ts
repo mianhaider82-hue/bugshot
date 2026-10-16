@@ -66,7 +66,7 @@ export function sanitizeReport(report: BugReport, enabled: boolean): BugReport {
 }
 
 /* ------------------------------------------------------------------ */
-/* Backend API client. The Claude API key NEVER lives here.           */
+/* Backend API client. The OpenAI API key NEVER lives here.           */
 /* ------------------------------------------------------------------ */
 
 export class BackendClient {
@@ -163,8 +163,8 @@ async function toAiPayload(report: BugReport) {
 }
 
 /**
- * The Claude API rejects images over 8000px on a side or ~5MB, and downscales
- * anything large anyway. Tall full-page captures are shrunk to fit and sent as
+ * GPT-4o downscales large images anyway (and caps uploads at 20MB), so there
+ * is no point sending a huge capture. Tall full-page captures are shrunk to fit and sent as
  * JPEG so the request stays small; the stored screenshot is untouched.
  */
 async function prepareImageForAi(dataUrl: string): Promise<string> {

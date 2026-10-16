@@ -6,19 +6,20 @@
  *   GET  /api/auth/google/login       → Google consent screen
  *   GET  /api/auth/google/callback
  *   GET  /api/auth/me | POST /api/auth/google/logout
- *   POST /api/analyze                 → Claude report draft
- *   POST /api/screenshot              → upload to Drive, returns link
+ *   POST /api/analyze                 → GPT-4o report draft
+ *   POST /api/screenshot              → upload to Cloudinary, returns URL
  *   GET  /api/sheets/list | /api/sheets/worksheets
  *   POST /api/sheets/submit           → append a row
  */
 
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { z } from 'zod';
 import { config } from './config.js';
 import { AiRefusalError, AnalyzeRequestSchema, analyzeReport } from './ai.js';
 import * as google from './google.js';
+import * as storage from './storage.js';
 import { createSession, isValidSession } from './store.js';
 import { reportToRow, SubmitRequestSchema } from './report.js';
 
@@ -52,7 +53,7 @@ const asyncRoute =
 /* ---------------- health + auth ---------------- */
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: config.claudeModel, google: google.connectedEmail() !== null });
+  res.json({ ok: true, model: config.openaiModel, google: google.connectedEmail() !== null });
 });
 
 app.post('/api/auth/session', (req, res) => {
@@ -102,7 +103,7 @@ app.post(
   requireSession,
   asyncRoute(async (req, res) => {
     const { reportId, image } = z.object({ reportId: z.string().max(64), image: z.string() }).parse(req.body);
-    res.json({ url: await google.uploadScreenshot(reportId, image) });
+    res.json({ url: await storage.uploadScreenshot(reportId, image) });
   }),
 );
 
@@ -139,10 +140,14 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof z.ZodError) return res.status(400).json({ error: 'Invalid request', issues: err.issues });
   if (err instanceof google.NotConnectedError) return res.status(401).json({ error: err.message });
   if (err instanceof AiRefusalError) return res.status(422).json({ error: err.message });
-  if (err instanceof Anthropic.RateLimitError) return res.status(429).json({ error: 'AI rate limited, retry shortly' });
-  if (err instanceof Anthropic.APIError) {
-    console.error('[claude]', err.status, err.message);
+  if (err instanceof OpenAI.RateLimitError) return res.status(429).json({ error: 'AI rate limited, retry shortly' });
+  if (err instanceof OpenAI.APIError) {
+    console.error('[openai]', err.status, err.message);
     return res.status(502).json({ error: `AI request failed (${err.status ?? 'network'})` });
+  }
+  if (storage.isCloudinaryError(err)) {
+    console.error('[cloudinary]', err.http_code, err.message);
+    return res.status(502).json({ error: `Screenshot upload failed: ${err.message}` });
   }
   const gStatus = (err as { code?: number; status?: number })?.status ?? (err as { code?: number })?.code;
   if (typeof gStatus === 'number' && gStatus >= 400 && gStatus < 600) {
@@ -159,5 +164,5 @@ function page(message: string): string {
 }
 
 app.listen(config.port, () => {
-  console.log(`QA Reporter backend on ${config.publicUrl} (model ${config.claudeModel})`);
+  console.log(`QA Reporter backend on ${config.publicUrl} (model ${config.openaiModel})`);
 });
